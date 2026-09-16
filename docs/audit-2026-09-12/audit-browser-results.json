@@ -1,0 +1,98 @@
+[
+  {
+    "name": "environment",
+    "browser": "Chrome 152.0.0.0 (Codex in-app browser)",
+    "platform": "macOS",
+    "adapter": "apple / metal-3",
+    "gpu": true
+  },
+  {
+    "name": "sampling-half-tie",
+    "waveDiffs": [
+      2,
+      0,
+      0
+    ],
+    "vectorDiffs": 2,
+    "cpuSums": [
+      3,
+      3,
+      3
+    ],
+    "gpuSums": [
+      3,
+      3,
+      3
+    ]
+  },
+  {
+    "name": "ycbcr-neutral-tie",
+    "waveDiffs": [
+      0,
+      2,
+      2
+    ],
+    "vectorDiffs": 0,
+    "cpuSums": [
+      1,
+      1,
+      1
+    ],
+    "gpuSums": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "name": "bt601-luma",
+    "waveDiffs": [
+      0
+    ],
+    "vectorDiffs": 0,
+    "cpuSums": [
+      256
+    ],
+    "gpuSums": [
+      256
+    ]
+  },
+  {
+    "name": "bt709-ycbcr",
+    "waveDiffs": [
+      18,
+      142,
+      64
+    ],
+    "vectorDiffs": 0,
+    "cpuSums": [
+      65536,
+      65536,
+      65536
+    ],
+    "gpuSums": [
+      65536,
+      65536,
+      65536
+    ]
+  },
+  {
+    "name": "array-fill-style",
+    "actual": "#123456"
+  },
+  {
+    "name": "invalid-roi-demotes-gpu",
+    "backend": "cpu",
+    "error": "region must be a positive rectangle in normalized 0..1 coordinates"
+  },
+  {
+    "name": "original-browser-smoke",
+    "passed": true,
+    "mismatchedBins": 0,
+    "samples": 57600,
+    "highBitDepthChecks": [
+      10,
+      12
+    ]
+  }
+]

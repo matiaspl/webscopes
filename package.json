@@ -1,0 +1,33 @@
+{
+  "name": "webscopes",
+  "version": "0.1.0",
+  "description": "Real-time waveform and vectorscope analysis for the web",
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "check:types": "node scripts/check-packed-types.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@webgpu/types": "^0.1.72"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

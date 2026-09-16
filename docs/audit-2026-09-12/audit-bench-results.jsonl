@@ -1,0 +1,2 @@
+{"mode":"rgb-parade","input":[1920,1080],"canvas":[960,520],"cpuMs":56.25108359999998,"renderJsMs":39.375391600000015,"cpuHistogramBytes":3407872}
+{"mode":"luma","input":[1920,1080],"canvas":[960,520],"cpuMs":30.33592520000002,"renderJsMs":32.424649799999955,"cpuHistogramBytes":1310720}

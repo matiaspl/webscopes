@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; connect-src 'none'; object-src 'none'; base-uri 'none'">
+  <title>webscopes · Electron DeckLink</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #e7edf4; background: #080b10; --muted: #8b98a8; --line: #202a36; --panel: #10161e; --accent: #77f2c0; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    main { width: min(1500px, 100%); margin: 0 auto; padding: 28px clamp(16px, 3vw, 40px) 38px; }
+    header { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin-bottom: 20px; }
+    .eyebrow { color: var(--accent); font: 650 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 8px 0 7px; font-size: clamp(25px, 3.5vw, 38px); line-height: 1.08; letter-spacing: -.045em; }
+    header p { max-width: 680px; margin: 0; color: var(--muted); }
+    .live-tag { display: flex; align-items: center; gap: 8px; color: #c7d2de; white-space: nowrap; font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px #77f2c080; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 12px; margin-bottom: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+    button, select { height: 36px; color: #e7edf4; font: inherit; border: 1px solid #303b49; border-radius: 7px; background: #151d27; padding: 0 11px; }
+    button { cursor: pointer; font-weight: 620; }
+    button:hover, select:hover { border-color: #536578; }
+    button:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+    button.primary { color: #06140f; background: var(--accent); border-color: var(--accent); }
+    button.stop { color: #ffd6d6; border-color: #673c42; }
+    .divider { height: 24px; width: 1px; background: var(--line); margin: 0 3px; }
+    .control-label { color: var(--muted); font: 600 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; margin-left: 5px; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr); gap: 14px; align-items: stretch; }
+    .panel { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+    .panel-heading { display: flex; min-height: 49px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 15px; border-bottom: 1px solid var(--line); }
+    .panel-heading h2 { margin: 0; color: #cbd5df; font: 650 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
+    .panel-meta { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
+    .video-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #030507; cursor: crosshair; touch-action: none; user-select: none; }
+    #preview { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .roi-box { position: absolute; display: none; z-index: 2; border: 1.5px solid var(--accent); box-shadow: 0 0 0 1px #07110e, 0 0 22px #77f2c03a; pointer-events: none; }
+    .roi-box::before, .roi-box::after { content: ""; position: absolute; width: 8px; height: 8px; border-color: #e6fff4; border-style: solid; }
+    .roi-box::before { top: -2px; left: -2px; border-width: 2px 0 0 2px; }
+    .roi-box::after { right: -2px; bottom: -2px; border-width: 0 2px 2px 0; }
+    .video-footer { display: flex; justify-content: space-between; gap: 11px; align-items: center; padding: 12px 14px; border-top: 1px solid var(--line); }
+    .scope-wrap { padding: 12px; }
+    #scope { display: block; width: 100%; height: auto; border-radius: 6px; background: #070a0e; }
+    .scope-legend { display: flex; justify-content: space-between; gap: 12px; padding: 0 3px 2px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #status { min-height: 39px; margin-top: 13px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 8px; color: #a8b5c3; background: #0d1218; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+    #status[data-kind="error"] { color: #ff9b9b; border-color: #673c42; }
+    .help { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 11px; color: var(--muted); font-size: 12px; }
+    .help strong { color: #cbd5df; font-weight: 620; }
+    @media (max-width: 960px) { .workspace { grid-template-columns: 1fr; } }
+    @media (max-width: 680px) { main { padding-top: 22px; } header { align-items: flex-start; flex-direction: column; gap: 12px; } .toolbar { gap: 8px; } .divider { display: none; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">WebScopes / Electron sample</div>
+        <h1>SDI in.<br>10-bit scopes out.</h1>
+        <p>Macadam captures DeckLink SDI directly as packed v210 for analysis and creates a reduced preview from those same frames.</p>
+      </div>
+      <div class="live-tag"><span class="live-dot"></span><span>DECKLINK · V210 · 10-BIT</span></div>
+    </header>
+
+    <section class="toolbar" aria-label="Capture and scope controls">
+      <label class="control-label" for="device">DeckLink</label>
+      <select id="device" aria-label="DeckLink input device" disabled><option value="">Refresh inputs…</option></select>
+      <button id="refresh" type="button">Refresh inputs</button>
+      <label class="control-label" for="mode">Mode</label>
+      <select id="mode" aria-label="DeckLink video mode" disabled><option value="">Select device first</option></select>
+      <button id="start" class="primary" type="button" disabled>Start SDI</button>
+      <button id="stop" class="stop" type="button" disabled>Stop</button>
+      <span class="divider"></span>
+      <span class="control-label">ROI</span>
+      <button type="button" data-region="full">Full frame</button>
+      <button type="button" data-region="center">Center</button>
+      <button type="button" data-region="left">Left</button>
+      <label class="control-label" for="waveform">Waveform</label>
+      <select id="waveform" aria-label="Waveform mode">
+        <option value="luma">Luma</option>
+        <option value="ycbcr-parade">YCbCr parade</option>
+        <option value="rgb-parade">RGB parade</option>
+        <option value="rgb">RGB overlay</option>
+        <option value="composite">Composite</option>
+      </select>
+      <label class="control-label" for="matrix">Matrix</label>
+      <select id="matrix" aria-label="Color matrix">
+        <option value="bt709">BT.709</option>
+        <option value="bt2020">BT.2020</option>
+        <option value="bt2100">BT.2100 HDR</option>
+        <option value="bt601">BT.601</option>
+      </select>
+      <label class="control-label" for="range">Range</label>
+      <select id="range" aria-label="Video range">
+        <option value="limited">Limited</option>
+        <option value="full">Full</option>
+      </select>
+    </section>
+
+    <section class="workspace" aria-label="SDI picture and scopes">
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>SDI picture / drag to select ROI</h2>
+          <span id="video-meta" class="panel-meta">No input selected</span>
+        </div>
+        <div id="stage" class="video-stage" aria-label="SDI preview; drag to select an analysis region">
+          <canvas id="preview" aria-label="Live DeckLink SDI preview"></canvas>
+          <div id="roi-box" class="roi-box"></div>
+        </div>
+        <div class="video-footer">
+          <span id="roi-meta" class="panel-meta">ROI 100% · full frame</span>
+          <span class="panel-meta">10-bit 4:2:2 source · preview is display-only</span>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>Live scopes</h2>
+          <span id="scope-meta" class="panel-meta">Waiting for SDI</span>
+        </div>
+        <div class="scope-wrap">
+          <div class="scope-legend"><span id="waveform-label">LUMA</span><span id="signal-meta">BT.709 · LIMITED · 10-BIT</span></div>
+          <canvas id="scope" width="960" height="520" aria-label="Live waveform and vectorscope"></canvas>
+        </div>
+      </article>
+    </section>
+
+    <div id="status" role="status" aria-live="polite">Choose a DeckLink device. Requires the Blackmagic Desktop Video driver and a Macadam native build.</div>
+    <div class="help">
+      <span><strong>Input:</strong> DeckLink SDI captured as 10-bit YUV/v210; the preview is derived from the capture frame.</span>
+      <span><strong>Drag or choose a preset:</strong> scope a region of interest.</span>
+      <span><strong>Analysis:</strong> CPU path, sampled to keep the live display responsive; waveform retains 10-bit code-value bins.</span>
+    </div>
+  </main>
+  <script type="module" src="./renderer.js"></script>
+</body>
+</html>

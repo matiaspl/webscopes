@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>webscopes · live ROI demo</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #e7edf4;
+      background: #080b10;
+      font-synthesis: none;
+      --muted: #8b98a8;
+      --line: #202a36;
+      --panel: #10161e;
+      --accent: #77f2c0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    main { width: min(1500px, 100%); margin: 0 auto; padding: 34px clamp(16px, 3vw, 42px) 48px; }
+    header { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; margin-bottom: 25px; }
+    .eyebrow { color: var(--accent); font: 650 11px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; text-transform: uppercase; }
+    h1 { margin: 8px 0 7px; font-size: clamp(25px, 3.5vw, 38px); line-height: 1.08; letter-spacing: -.045em; }
+    header p { max-width: 650px; margin: 0; color: var(--muted); }
+    .live-tag { display: flex; align-items: center; gap: 8px; color: #c7d2de; white-space: nowrap; font: 600 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .source-credit { color: var(--accent); font: 600 10px ui-monospace, SFMono-Regular, Menlo, monospace; text-decoration: none; white-space: nowrap; }
+    .source-credit:hover { text-decoration: underline; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px #77f2c080; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; padding: 12px; margin-bottom: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+    button, select, input { color: #e7edf4; font: inherit; }
+    button, select { height: 36px; border: 1px solid #303b49; border-radius: 7px; background: #151d27; padding: 0 11px; }
+    button { cursor: pointer; font-weight: 620; }
+    button:hover, select:hover { border-color: #536578; }
+    button.primary { color: #06140f; background: var(--accent); border-color: var(--accent); }
+    .divider { height: 24px; width: 1px; background: var(--line); margin: 0 3px; }
+    .control-label { color: var(--muted); font: 600 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .08em; text-transform: uppercase; margin-left: 5px; }
+    .source-line { display: flex; min-width: 260px; flex: 1 1 390px; align-items: center; gap: 9px; }
+    .source-line input { height: 36px; min-width: 0; flex: 1; padding: 0 10px; border: 1px solid #303b49; border-radius: 7px; background: #0a0f15; color: #aebaca; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr); gap: 14px; align-items: stretch; }
+    .panel { min-width: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+    .panel-heading { display: flex; min-height: 49px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 15px; border-bottom: 1px solid var(--line); }
+    .panel-heading h2 { margin: 0; color: #cbd5df; font: 650 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
+    .source-note { padding: 9px 14px; border-top: 1px solid var(--line); color: var(--muted); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .panel-meta { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .video-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #030507; cursor: crosshair; touch-action: none; user-select: none; }
+    video:not([hidden]), #slate-preview:not([hidden]) { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .roi-box { position: absolute; display: none; z-index: 2; border: 1.5px solid var(--accent); box-shadow: 0 0 0 1px #07110e, 0 0 22px #77f2c03a; pointer-events: none; }
+    .roi-box::before, .roi-box::after { content: ""; position: absolute; width: 8px; height: 8px; border-color: #e6fff4; border-style: solid; }
+    .roi-box::before { top: -2px; left: -2px; border-width: 2px 0 0 2px; }
+    .roi-box::after { right: -2px; bottom: -2px; border-width: 0 2px 2px 0; }
+    .video-footer { display: grid; grid-template-columns: auto minmax(50px, 1fr) auto; gap: 11px; align-items: center; padding: 12px 14px; border-top: 1px solid var(--line); }
+    .playback-controls { display: flex; align-items: center; gap: 6px; }
+    .playback-controls button { min-width: 42px; height: 34px; padding: 0 8px; font-size: 12px; }
+    .playback-controls #play { min-width: 68px; }
+    #seek { width: 100%; accent-color: var(--accent); }
+    #seek:disabled { opacity: .45; }
+    #file-input { display: none; }
+    .time { min-width: 86px; color: #aebaca; text-align: right; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .scope-wrap { padding: 12px; }
+    #scope { display: block; width: 100%; height: auto; border-radius: 6px; background: #070a0e; }
+    .scope-legend { display: flex; justify-content: space-between; gap: 12px; padding: 0 3px 2px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #status { min-height: 37px; margin-top: 13px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 8px; color: #a8b5c3; background: #0d1218; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    #status[data-kind="error"] { color: #ff9b9b; border-color: #673c42; }
+    .help { display: flex; flex-wrap: wrap; gap: 8px 20px; margin-top: 11px; color: var(--muted); font-size: 12px; }
+    .help strong { color: #cbd5df; font-weight: 620; }
+    @media (max-width: 960px) { .workspace { grid-template-columns: 1fr; } }
+    @media (max-width: 680px) {
+      main { padding-top: 22px; }
+      header { align-items: flex-start; }
+      .live-tag { margin-top: 5px; }
+      header p { font-size: 13px; }
+      .divider { display: none; }
+      .toolbar { gap: 8px; }
+      .control-label { margin-left: 2px; }
+      .source-line { flex-basis: 100%; order: 10; }
+      .video-footer { grid-template-columns: minmax(0, 1fr) auto; gap: 9px; }
+      .playback-controls { grid-column: 1 / -1; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">WebScopes / field demo</div>
+        <h1>Follow the picture.<br>Scope the region.</h1>
+        <p>Draw a region over the moving picture and watch the waveform and vectorscope respond in real time.</p>
+      </div>
+      <div class="live-tag"><span class="live-dot"></span><span id="content-tag">HLS · BIG BUCK BUNNY</span></div>
+    </header>
+
+    <section class="toolbar" aria-label="Demo controls">
+      <label class="control-label" for="content">Content</label>
+      <select id="content" aria-label="Demo video content">
+        <option value="" disabled>Demo stream</option>
+        <option value="bbb">Big Buck Bunny · HLS</option>
+        <option value="sagrada">Sagrada Família · 3Cat DASH</option>
+        <option value="slate-smpte">Internal · SMPTE RP 219-1 bars</option>
+        <option value="slate-ebu">Internal · EBU Tech 3373 HLG bars</option>
+        <option value="slate-arib">Internal · ARIB STD-B28 bars</option>
+        <option value="slate-diagnostic">Internal · Analyzer diagnostic (custom)</option>
+      </select>
+      <button id="camera" type="button">Use webcam</button>
+      <button id="choose-file" type="button">Open video file</button>
+      <button id="share-screen" type="button" title="Choose a Chrome tab, window, or screen to capture">Capture tab / window / screen</button>
+      <input id="file-input" type="file" accept="video/*" aria-label="Choose a local video file">
+      <span class="control-label">ROI</span>
+      <button type="button" data-region="full">Full frame</button>
+      <button type="button" data-region="center">Center</button>
+      <button type="button" data-region="left">Left</button>
+      <span class="divider"></span>
+      <label class="control-label" for="backend">Backend</label>
+      <select id="backend" aria-label="Scope analysis backend">
+        <option value="auto">Auto</option>
+        <option value="webgpu">WebGPU</option>
+        <option value="cpu">CPU</option>
+      </select>
+      <label class="control-label" for="matrix">Matrix</label>
+      <select id="matrix" aria-label="Color matrix override" title="Override the matrix used for YCbCr and vectorscope calculations">
+        <option value="">Auto</option>
+        <option value="bt709">BT.709</option>
+        <option value="bt2020">BT.2020</option>
+        <option value="bt2100">BT.2100 HDR</option>
+        <option value="bt601">BT.601</option>
+      </select>
+      <label class="control-label" for="range">Range</label>
+      <select id="range" aria-label="Color range override" title="Override the signal range when the input provides YCbCr samples">
+        <option value="">Auto</option>
+        <option value="limited">Limited</option>
+        <option value="full">Full</option>
+      </select>
+      <label class="control-label" for="waveform">Waveform</label>
+      <select id="waveform" aria-label="Waveform display mode">
+        <option value="rgb-parade">RGB parade</option>
+        <option value="rgb">RGB overlay</option>
+        <option value="luma">Luma</option>
+        <option value="ycbcr-parade">YCbCr parade</option>
+        <option value="composite">Composite</option>
+      </select>
+      <label class="control-label" for="probe-resolution">Probe</label>
+      <select id="probe-resolution" aria-label="Probe resolution" title="Sparse analysis sampling; playback quality stays adaptive">
+        <option value="1">100% · Native</option>
+        <option value="0.75">75%</option>
+        <option value="0.5">50%</option>
+        <option value="0.25">25%</option>
+      </select>
+      <button id="popout-scopes" type="button" title="Open scopes in a separate window">Pop out scopes</button>
+      <div class="source-line">
+        <label id="source-label" class="control-label" for="source">HLS</label>
+        <input id="source" aria-label="Media source URL" readonly value="https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8">
+        <button id="reload" type="button">Reload</button>
+      </div>
+    </section>
+
+    <section class="workspace" aria-label="Video and scopes">
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>Picture / drag to select ROI</h2>
+          <span id="video-meta" class="panel-meta">Waiting for stream…</span>
+        </div>
+        <div id="stage" class="video-stage" aria-label="Video image; drag to select the analysis region">
+          <video id="video" muted playsinline crossorigin="anonymous" preload="metadata"></video>
+          <canvas id="slate-preview" aria-label="Generated internal test slate" hidden></canvas>
+          <div id="roi-box" class="roi-box"></div>
+        </div>
+        <div class="video-footer">
+          <div class="playback-controls" aria-label="Playback controls">
+            <button id="back-10" type="button" aria-label="Back 10 seconds" title="Back 10 seconds">−10s</button>
+            <button id="play" class="primary" type="button">Play</button>
+            <button id="forward-10" type="button" aria-label="Forward 10 seconds" title="Forward 10 seconds">+10s</button>
+            <button id="mute" type="button">Muted</button>
+          </div>
+          <input id="seek" aria-label="Seek video" type="range" min="0" max="1000" value="0" step="1">
+          <span id="time" class="time">0:00 / --:--</span>
+        </div>
+        <div id="source-note" class="source-note" hidden>
+          <span id="source-note-copy"></span>
+          <a id="source-credit" class="source-credit" href="https://www.youtube.com/watch?v=odBWmbca9sc" target="_blank" rel="noopener">Original 4K HDR on YouTube ↗</a>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-heading">
+          <h2>Live scopes</h2>
+          <span id="roi-meta" class="panel-meta">ROI 100% · 16:9</span>
+        </div>
+        <div class="scope-wrap">
+          <div class="scope-legend"><span id="waveform-label">RGB PARADE</span><span id="color-legend">BT.709 · AUTO RANGE · DISPLAY DITHER 0 · VECTOR DITHER 0</span></div>
+          <canvas id="scope" width="960" height="520" aria-label="Live waveform and vectorscope"></canvas>
+        </div>
+      </article>
+    </section>
+
+    <div id="status" role="status" aria-live="polite">Connecting to the public HLS demo stream…</div>
+    <div class="help">
+      <span><strong>Webcam</strong> requests camera access; click Stop camera or switch sources to release it.</span>
+      <span><strong>Open video file</strong> analyzes a local file in your browser.</span>
+      <span><strong>Capture tab / window / screen</strong> opens Chrome's native picker and analyzes the selected display as a live video source; stop sharing or switch sources to release it.</span>
+      <span><strong>Playback</strong> controls sit beside the progress bar; seek and 10-second skips work when the source is seekable.</span>
+      <span><strong>Drag</strong> over the video to set a custom region.</span>
+      <span><strong>Click a preset</strong> to compare color from different parts of the frame.</span>
+      <span><strong>Probe resolution</strong> keeps playback at its adaptive stream resolution and sparsely samples the decoded frame at 100%, 75%, 50%, or 25% in each dimension.</span>
+      <span><strong>Internal slates</strong> generate standards-defined SMPTE RP 219-1, EBU Tech 3373, and ARIB STD-B28 10-bit v210 signals, plus one explicitly custom diagnostic slate; matrix and range changes regenerate the encoded test signal.</span>
+      <span><strong>Color overrides</strong> use Auto by default; choose a matrix or range when source metadata is missing or incorrect. Range affects YCbCr inputs; browser RGB frames are already decoded.</span>
+      <span>Scopes analyze each distinct presented frame once, then follow the selected ROI.</span>
+      <span>Dither and display interpolation soften quantized contours without changing the measured histogram.</span>
+    </div>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.dashjs.org/v5.2.0/modern/umd/dash.all.min.js" crossorigin="anonymous"></script>
+  <script type="module" src="./live-roi-demo.js"></script>
+</body>
+</html>

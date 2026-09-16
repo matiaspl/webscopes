@@ -1,0 +1,15 @@
+{"name":"default-precision-implicit","bitDepth":10,"levels":1024,"peakRow":512}
+{"name":"default-precision-helper","bitDepth":8,"levels":256,"peakRow":255}
+{"name":"truncated-padded-rows","accepted":true,"samples":2,"waveSums":[1,1,1],"vectorSum":1}
+{"name":"fractional-pixel-stride","accepted":true,"samples":2,"waveSums":[1,1,1],"vectorSum":1}
+{"name":"nan-pixel-stride","accepted":true,"samples":2,"waveSums":[0,0,0],"vectorSum":0}
+{"name":"nan-float-sample","accepted":true,"samples":1,"waveSums":[0,1,1],"vectorSum":0}
+{"name":"prototype-matrix","accepted":true,"samples":2,"waveSums":[0],"vectorSum":0}
+{"name":"vectorscope-red-target","rasterSize":386,"tracePixels":[[706,88],[707,88],[706,89],[707,89]],"redTarget":[712.0821470144427,111.16,3,0,6.283185307179586]}
+{"name":"vectorscope-gray-downscale","rasterSize":117,"litPixels":0,"vectorSum":1}
+{"name":"device-only-injection","accepted":false,"error":"WebGPU is not available in this browser"}
+{"name":"raw-error-demotes-gpu","backend":"cpu","warnings":["WebGPU frame analysis failed; switching to CPU. Expected an RGBA pixel frame with width * height * 4 bytes"]}
+{"name":"copy-error-scope-balance","pushes":1,"pops":0,"destroyed":0}
+{"name":"owned-device-init-failure","pushes":0,"pops":0,"destroyed":0}
+{"name":"destroyed-result-resurrected","pendingError":"Scope analyzer has been destroyed","resultPresent":true}
+{"name":"cpu-repeated-canvas-allocation","updates":20,"canvasCreations":20}

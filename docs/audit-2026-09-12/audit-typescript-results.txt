@@ -1,0 +1,4 @@
+types/index.d.ts(39,9): error TS2304: Cannot find name 'GPU'.
+types/index.d.ts(40,13): error TS2304: Cannot find name 'GPUAdapter'.
+types/index.d.ts(41,12): error TS2304: Cannot find name 'GPUDevice'.
+types/index.d.ts(42,20): error TS2304: Cannot find name 'GPURequestAdapterOptions'.

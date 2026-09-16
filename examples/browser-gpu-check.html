@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>webscopes browser GPU check</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #080d13; color: #dbe6ee; }
+    body { max-width: 1200px; margin: 28px auto; padding: 0 20px; }
+    h1 { font: 600 22px/1.2 system-ui, sans-serif; }
+    #status { padding: 14px; border: 1px solid #273949; border-radius: 8px; white-space: pre-wrap; }
+    .views { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    figure { min-width: 0; margin: 0; }
+    figcaption { margin: 0 0 8px; font: 600 13px system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: auto; border: 1px solid #273949; border-radius: 6px; }
+    @media(max-width: 760px) { .views { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>webscopes: real browser GPU and CPU check</h1>
+  <pre id="status">Preparing synthetic color bars…</pre>
+  <div class="views">
+    <figure><figcaption>CPU analysis · display dither 0</figcaption><canvas id="cpu" width="960" height="540"></canvas></figure>
+    <figure><figcaption>WebGPU analysis · display dither 0</figcaption><canvas id="gpu" width="960" height="540"></canvas></figure>
+  </div>
+  <script type="module" src="./browser-gpu-check.js"></script>
+</body>
+</html>
