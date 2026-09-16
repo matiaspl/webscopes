@@ -236,6 +236,17 @@ export async function createWebGpuAnalyzer(options = {}) {
     bindGroup = undefined;
   }
 
+  function isRgbaPixelSource(source) {
+    return source?.data != null
+      && Number.isInteger(source.width)
+      && Number.isInteger(source.height)
+      && source.format !== "v210"
+      && ArrayBuffer.isView(source.data)
+      && source.data.BYTES_PER_ELEMENT === 1
+      && (source.pixelStride ?? 4) === 4
+      && (source.bytesPerRow ?? source.width * 4) === source.width * 4;
+  }
+
   try {
     if (!device) {
       let adapter = options.adapter;
@@ -297,11 +308,20 @@ export async function createWebGpuAnalyzer(options = {}) {
 
         await withValidationScope(() => {
           ensureTexture(width, height);
-          device.queue.copyExternalImageToTexture(
-            { source },
-            { texture, colorSpace: "srgb", premultipliedAlpha: false },
-            { width, height },
-          );
+          if (isRgbaPixelSource(source)) {
+            device.queue.writeTexture(
+              { texture },
+              source.data,
+              { bytesPerRow: width * 4, rowsPerImage: height },
+              { width, height, depthOrArrayLayers: 1 },
+            );
+          } else {
+            device.queue.copyExternalImageToTexture(
+              { source },
+              { texture, colorSpace: "srgb", premultipliedAlpha: false },
+              { width, height },
+            );
+          }
           ensureBuffers(byteLength);
           device.queue.writeBuffer(paramsBuffer, 0, parameterBytes);
           if (!bindGroup) bindGroup = device.createBindGroup({

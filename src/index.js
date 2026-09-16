@@ -1,4 +1,4 @@
-import { analyzeFrame, getSourceSize, isRawPixelFrame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
+import { analyzeFrame, captureFrameToCanvas, getSourceSize, isRawPixelFrame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
 import { renderScopes } from "./render.js";
 import { generateTestSignalSlate, TEST_SIGNAL_COLOR_MATRICES, TEST_SIGNAL_COLOR_RANGES, TEST_SIGNAL_PATTERNS } from "./slates.js";
 import { createWebGpuAnalyzer } from "./webgpu.js";
@@ -39,12 +39,15 @@ export async function createScopes(options = {}) {
   let renderingDisabled = false;
   let renderWarningReported = false;
   const cpuCapture = {};
+  const browserSourceCapture = {};
 
   function releaseCpuCapture() {
     cpuCapture.canvas = undefined;
     cpuCapture.context = undefined;
     cpuCapture.data = undefined;
     cpuCapture.videoFrameReadback = undefined;
+    browserSourceCapture.canvas = undefined;
+    browserSourceCapture.context = undefined;
   }
 
   function update(frame, analysisOptions = {}) {
@@ -63,12 +66,36 @@ export async function createScopes(options = {}) {
       let nextResult;
       let analysisSource = frame;
       let ownsAnalysisSource = false;
-      if (!rawPixels && typeof globalThis.VideoFrame === "function" && !(frame instanceof globalThis.VideoFrame)) {
+      let sharedCanvasCapture;
+      let sharedPixelSource;
+      const isVideoFrame = typeof globalThis.VideoFrame === "function" && frame instanceof globalThis.VideoFrame;
+      const isVideoSource = (typeof globalThis.HTMLVideoElement === "function" && frame instanceof globalThis.HTMLVideoElement)
+        || frame?.nodeName === "VIDEO"
+        || frame?.tagName === "VIDEO"
+        || (Number.isFinite(frame?.videoWidth) && Number.isFinite(frame?.videoHeight) && Number.isFinite(frame?.currentTime));
+      if (!rawPixels && useGpu && isVideoSource) {
+        try {
+          sharedPixelSource = await readFramePixelsAsync(frame, cpuCapture);
+          analysisSource = sharedPixelSource;
+        } catch {
+          // Keep the browser source when a video cannot be read back as RGBA.
+        }
+      }
+      if (!rawPixels && !sharedPixelSource && typeof globalThis.VideoFrame === "function" && !isVideoFrame) {
         try {
           analysisSource = new globalThis.VideoFrame(frame, { timestamp: 0 });
           ownsAnalysisSource = true;
         } catch {
           // Keep the original source when this browser cannot snapshot it as a VideoFrame.
+        }
+      }
+      if (!rawPixels && !sharedPixelSource && !ownsAnalysisSource && !isVideoFrame) {
+        try {
+          const browserSource = captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" });
+          sharedCanvasCapture = captureFrameToCanvas(browserSource.canvas, cpuCapture, { willReadFrequently: false, colorSpace: "srgb" });
+          analysisSource = sharedCanvasCapture.canvas;
+        } catch {
+          // Keep the original source when the browser cannot capture it to a canvas.
         }
       }
       try {
@@ -83,10 +110,22 @@ export async function createScopes(options = {}) {
             gpuAnalyzer = undefined;
             backend = "cpu";
             frameBackend = "cpu";
-            nextResult = analyzeFrame(await readFramePixelsAsync(analysisSource, cpuCapture), frameOptions);
+            nextResult = analyzeFrame(
+              sharedPixelSource
+                ?? (sharedCanvasCapture
+                  ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
+                  : await readFramePixelsAsync(analysisSource, cpuCapture)),
+              frameOptions,
+            );
           }
         } else {
-          nextResult = analyzeFrame(await readFramePixelsAsync(analysisSource, cpuCapture), frameOptions);
+          nextResult = analyzeFrame(
+            sharedPixelSource
+              ?? (sharedCanvasCapture
+                ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
+                : await readFramePixelsAsync(analysisSource, cpuCapture)),
+            frameOptions,
+          );
         }
       } finally {
         if (ownsAnalysisSource) analysisSource.close();

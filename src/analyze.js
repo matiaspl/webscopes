@@ -87,11 +87,10 @@ export function isV210Frame(frame) {
   return frame?.format === "v210";
 }
 
-export function readFramePixels(frame, reusableCapture) {
-  if (isRawPixelFrame(frame)) return frame;
+export function captureFrameToCanvas(frame, reusableCapture = {}, contextOptions = { willReadFrequently: true, colorSpace: "srgb" }) {
+  if (isRawPixelFrame(frame)) throw new TypeError("Raw pixel frames do not have a browser canvas source");
   const { width, height } = getSourceSize(frame);
-  const capture = reusableCapture ?? {};
-  let canvas = capture.canvas;
+  let canvas = reusableCapture.canvas;
   if (!canvas) {
     if (typeof OffscreenCanvas !== "undefined") {
       canvas = new OffscreenCanvas(width, height);
@@ -100,14 +99,20 @@ export function readFramePixels(frame, reusableCapture) {
     } else {
       throw new TypeError("CPU analysis needs RGBA pixel data or a browser canvas source");
     }
-    capture.canvas = canvas;
+    reusableCapture.canvas = canvas;
   }
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
-  const context = capture.context ?? canvas.getContext("2d", { willReadFrequently: true });
+  const context = reusableCapture.context ?? canvas.getContext("2d", contextOptions);
   if (!context) throw new Error("Could not create a 2D canvas context for CPU analysis");
-  capture.context = context;
+  reusableCapture.context = context;
   context.drawImage(frame, 0, 0, width, height);
+  return { canvas, context, width, height };
+}
+
+export function readFramePixels(frame, reusableCapture) {
+  if (isRawPixelFrame(frame)) return frame;
+  const { context, width, height } = captureFrameToCanvas(frame, reusableCapture, { willReadFrequently: true, colorSpace: "srgb" });
   return context.getImageData(0, 0, width, height);
 }
 

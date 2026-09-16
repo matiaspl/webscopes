@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>webscopes video CPU/GPU check</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #080d13; color: #dbe6ee; }
+    body { max-width: 1000px; margin: 28px auto; padding: 0 20px; }
+    h1 { font: 600 22px/1.2 system-ui, sans-serif; }
+    #status { padding: 14px; border: 1px solid #273949; border-radius: 8px; white-space: pre-wrap; }
+    video { display: block; width: min(100%, 640px); margin: 16px 0; border: 1px solid #273949; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>webscopes: real video CPU/GPU check</h1>
+  <pre id="status">Loading a decoded HLS video frame…</pre>
+  <video id="video" muted playsinline crossorigin="anonymous"></video>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <script type="module" src="./video-gpu-check.js"></script>
+</body>
+</html>

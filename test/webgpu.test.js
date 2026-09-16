@@ -36,6 +36,7 @@ function mockDevice(overrides = {}) {
     bufferCreates: 0,
     unmaps: 0,
     copyCalls: 0,
+    writeTextureCalls: 0,
     bindGroupCreates: 0,
   };
   const limits = {
@@ -61,6 +62,9 @@ function mockDevice(overrides = {}) {
       copyExternalImageToTexture() {
         state.copyCalls += 1;
         if (overrides.copyThrows) throw new Error("synthetic copy error");
+      },
+      writeTexture() {
+        state.writeTextureCalls += 1;
       },
       writeBuffer() {},
       submit() {},
@@ -208,6 +212,25 @@ test("uses a supplied device without requiring navigator.gpu or an adapter", asy
     analyzer.destroy();
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(device.state.deviceDestroyCalls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("uploads canonical RGBA pixel sources instead of using external-image conversion", async () => {
+  const restore = installGpuConstants();
+  try {
+    const device = mockDevice();
+    const analyzer = await createWebGpuAnalyzer({ device });
+    const result = await analyzer.analyze({
+      width: 2,
+      height: 1,
+      data: new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255]),
+    }, { waveformWidth: 2, waveformHeight: 16, vectorscopeSize: 64 });
+    assert.equal(result.sampleCount, 2);
+    assert.equal(device.state.writeTextureCalls, 1);
+    assert.equal(device.state.copyCalls, 0);
+    analyzer.destroy();
   } finally {
     restore();
   }
