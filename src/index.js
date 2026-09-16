@@ -61,21 +61,35 @@ export async function createScopes(options = {}) {
       normalizeAnalysisOptions(width, height, frameOptions);
       let frameBackend = useGpu ? "webgpu" : "cpu";
       let nextResult;
-      if (useGpu) {
+      let analysisSource = frame;
+      let ownsAnalysisSource = false;
+      if (!rawPixels && typeof globalThis.VideoFrame === "function" && !(frame instanceof globalThis.VideoFrame)) {
         try {
-          nextResult = await gpuAnalyzer.analyze(frame, frameOptions);
-        } catch (error) {
-          if (destroyed) throw new Error("Scope analyzer has been destroyed");
-          if (requestedBackend !== "auto" || backend !== "webgpu") throw error;
-          options.onWarning?.(`WebGPU frame analysis failed; switching to CPU. ${error.message}`);
-          gpuAnalyzer.destroy();
-          gpuAnalyzer = undefined;
-          backend = "cpu";
-          frameBackend = "cpu";
-          nextResult = analyzeFrame(await readFramePixelsAsync(frame, cpuCapture), frameOptions);
+          analysisSource = new globalThis.VideoFrame(frame, { timestamp: 0 });
+          ownsAnalysisSource = true;
+        } catch {
+          // Keep the original source when this browser cannot snapshot it as a VideoFrame.
         }
-      } else {
-        nextResult = analyzeFrame(await readFramePixelsAsync(frame, cpuCapture), frameOptions);
+      }
+      try {
+        if (useGpu) {
+          try {
+            nextResult = await gpuAnalyzer.analyze(analysisSource, frameOptions);
+          } catch (error) {
+            if (destroyed) throw new Error("Scope analyzer has been destroyed");
+            if (requestedBackend !== "auto" || backend !== "webgpu") throw error;
+            options.onWarning?.(`WebGPU frame analysis failed; switching to CPU. ${error.message}`);
+            gpuAnalyzer.destroy();
+            gpuAnalyzer = undefined;
+            backend = "cpu";
+            frameBackend = "cpu";
+            nextResult = analyzeFrame(await readFramePixelsAsync(analysisSource, cpuCapture), frameOptions);
+          }
+        } else {
+          nextResult = analyzeFrame(await readFramePixelsAsync(analysisSource, cpuCapture), frameOptions);
+        }
+      } finally {
+        if (ownsAnalysisSource) analysisSource.close();
       }
       if (destroyed) throw new Error("Scope analyzer has been destroyed");
       const frameTimeMs = Math.max(0, (globalThis.performance?.now?.() ?? Date.now()) - startedAt);

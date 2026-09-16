@@ -137,7 +137,7 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
       if (!(reusableCapture.data instanceof Uint8Array) || reusableCapture.data.byteLength !== byteLength) {
         reusableCapture.data = new Uint8Array(byteLength);
       }
-      await videoFrame.copyTo(reusableCapture.data, { format: "RGBA" });
+      await videoFrame.copyTo(reusableCapture.data, { format: "RGBA", colorSpace: "srgb" });
       return { width, height, data: reusableCapture.data };
     } catch {
       // Some browsers expose VideoFrame but do not support constructing one

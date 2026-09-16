@@ -297,7 +297,11 @@ export async function createWebGpuAnalyzer(options = {}) {
 
         await withValidationScope(() => {
           ensureTexture(width, height);
-          device.queue.copyExternalImageToTexture({ source }, { texture }, { width, height });
+          device.queue.copyExternalImageToTexture(
+            { source },
+            { texture, colorSpace: "srgb", premultipliedAlpha: false },
+            { width, height },
+          );
           ensureBuffers(byteLength);
           device.queue.writeBuffer(paramsBuffer, 0, parameterBytes);
           if (!bindGroup) bindGroup = device.createBindGroup({
