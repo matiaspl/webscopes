@@ -143,6 +143,7 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
         reusableCapture.data = new Uint8Array(byteLength);
       }
       await videoFrame.copyTo(reusableCapture.data, { format: "RGBA", colorSpace: "srgb" });
+      if (!hasOpaqueRgbaAlpha(reusableCapture.data)) throw new TypeError("VideoFrame RGBA readback is not opaque");
       return { width, height, data: reusableCapture.data };
     } catch {
       // Some browsers expose VideoFrame but do not support constructing one
@@ -154,6 +155,18 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
     }
   }
   return readFramePixels(frame, reusableCapture);
+}
+
+function hasOpaqueRgbaAlpha(data) {
+  // Decoded video frames are opaque. Safari can resolve VideoFrame.copyTo with
+  // a buffer that is not actually RGBA; reject it before analysis consumes the
+  // malformed bytes and use the canvas fallback instead.
+  const pixelCount = data.length / 4;
+  const step = Math.max(1, Math.floor(pixelCount / 32));
+  for (let pixel = 0; pixel < pixelCount; pixel += step) {
+    if (data[pixel * 4 + 3] !== 255) return false;
+  }
+  return true;
 }
 
 function validatePixelLayout(pixels) {

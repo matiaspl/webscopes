@@ -122,6 +122,51 @@ test("real-time CPU analysis reuses a WebCodecs RGBA buffer", async () => {
   }
 });
 
+test("falls back when VideoFrame RGBA readback is malformed", async () => {
+  const previousVideoFrame = globalThis.VideoFrame;
+  const previousOffscreenCanvas = globalThis.OffscreenCanvas;
+  class BrokenVideoFrame {
+    constructor() {
+      this.displayWidth = 2;
+      this.displayHeight = 1;
+    }
+
+    async copyTo(destination) {
+      destination.set([10, 20, 30, 0, 40, 50, 60, 0]);
+    }
+
+    close() {}
+  }
+  class FakeCanvas {
+    constructor(width, height) {
+      this.width = width;
+      this.height = height;
+    }
+
+    getContext() {
+      return {
+        drawImage() {},
+        getImageData() {
+          return { width: 2, height: 1, data: new Uint8ClampedArray([1, 2, 3, 255, 4, 5, 6, 255]) };
+        },
+      };
+    }
+  }
+  globalThis.VideoFrame = BrokenVideoFrame;
+  globalThis.OffscreenCanvas = FakeCanvas;
+  try {
+    const capture = {};
+    const result = await readFramePixelsAsync({ videoWidth: 2, videoHeight: 1 }, capture);
+    assert.deepEqual([...result.data], [1, 2, 3, 255, 4, 5, 6, 255]);
+    assert.equal(capture.videoFrameReadback, false);
+  } finally {
+    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+    else globalThis.VideoFrame = previousVideoFrame;
+    if (previousOffscreenCanvas === undefined) delete globalThis.OffscreenCanvas;
+    else globalThis.OffscreenCanvas = previousOffscreenCanvas;
+  }
+});
+
 test("keeps neutral chroma values on the vectorscope center axis", () => {
   const grays = frame([[[0, 0, 0], [32, 32, 32], [128, 128, 128], [235, 235, 235], [255, 255, 255]]]);
   const result = analyzeFrame(grays, { vectorscopeSize: 256, waveformWidth: 5 });
