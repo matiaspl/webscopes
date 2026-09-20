@@ -118,9 +118,9 @@ export function readFramePixels(frame, reusableCapture) {
 
 /**
  * Read a browser source without allocating a new ImageData object on every
- * frame when WebCodecs is available. The destination RGBA buffer is reused by
- * the real-time analyzer and is safe to recycle because createScopes awaits
- * each CPU analysis before accepting the next one.
+ * frame when WebCodecs is available. Prefer RGBX because decoded video is
+ * opaque and Safari has returned non-opaque data for RGBA readback. The
+ * destination buffer is safe to reuse because createScopes serializes updates.
  */
 export async function readFramePixelsAsync(frame, reusableCapture = {}) {
   if (isRawPixelFrame(frame)) return frame;
@@ -138,18 +138,43 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
       if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
         throw new TypeError("VideoFrame must expose positive integer display dimensions");
       }
-      const byteLength = width * height * 4;
-      if (!(reusableCapture.data instanceof Uint8Array) || reusableCapture.data.byteLength !== byteLength) {
-        reusableCapture.data = new Uint8Array(byteLength);
+      const packedByteLength = width * height * 4;
+      if (!Number.isSafeInteger(packedByteLength)) throw new RangeError("VideoFrame dimensions exceed the RGBA readback limit");
+      const formats = reusableCapture.videoFramePixelFormat === "RGBX"
+        ? ["RGBX", "RGBA"]
+        : reusableCapture.videoFramePixelFormat === "RGBA"
+          ? ["RGBA", "RGBX"]
+          : ["RGBX", "RGBA"];
+      let lastReadbackError;
+      for (const format of formats) {
+        try {
+          const copyOptions = { format, colorSpace: "srgb" };
+          const byteLength = typeof videoFrame.allocationSize === "function"
+            ? videoFrame.allocationSize(copyOptions)
+            : packedByteLength;
+          if (!Number.isSafeInteger(byteLength) || byteLength !== packedByteLength) {
+            throw new RangeError(`Unexpected ${format} VideoFrame readback size: ${byteLength}`);
+          }
+          if (!(reusableCapture.data instanceof Uint8Array) || reusableCapture.data.byteLength !== byteLength) {
+            reusableCapture.data = new Uint8Array(byteLength);
+          }
+          await videoFrame.copyTo(reusableCapture.data, copyOptions);
+          if (format === "RGBA" && !hasOpaqueRgbaAlpha(reusableCapture.data)) {
+            throw new TypeError("VideoFrame RGBA readback is not opaque");
+          }
+          reusableCapture.videoFramePixelFormat = format;
+          return { width, height, data: reusableCapture.data };
+        } catch (error) {
+          lastReadbackError = error;
+        }
       }
-      await videoFrame.copyTo(reusableCapture.data, { format: "RGBA", colorSpace: "srgb" });
-      if (!hasOpaqueRgbaAlpha(reusableCapture.data)) throw new TypeError("VideoFrame RGBA readback is not opaque");
-      return { width, height, data: reusableCapture.data };
+      throw lastReadbackError ?? new TypeError("VideoFrame pixel readback failed");
     } catch {
       // Some browsers expose VideoFrame but do not support constructing one
-      // from this CanvasImageSource or copying it as RGBA. Avoid retrying the
-      // unsupported path for every live frame and use the canvas fallback.
+      // from this CanvasImageSource or copying it as RGBX/RGBA. Avoid retrying
+      // the unsupported path for every live frame and use the canvas fallback.
       reusableCapture.videoFrameReadback = false;
+      reusableCapture.videoFramePixelFormat = undefined;
     } finally {
       if (ownsVideoFrame) videoFrame?.close();
     }

@@ -49,6 +49,8 @@ export interface TestSignalSlate {
 
 export interface ScopeOptions {
   backend?: BackendName;
+  /** Video input path for WebGPU. "auto" uses reusable texture copies on Safari and external textures elsewhere. */
+  videoTextureMode?: "auto" | "copy" | "external";
   canvas?: HTMLCanvasElement | OffscreenCanvas | CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
   autoRender?: boolean;
   waveformMode?: WaveformModeName;
@@ -130,6 +132,8 @@ export interface ScopeResult {
 
 export interface Scopes {
   readonly backend: "webgpu" | "cpu";
+  /** Selected WebGPU video input path; undefined when the instance uses CPU. */
+  readonly videoTextureMode: "copy" | "external" | undefined;
   readonly result: ScopeResult | undefined;
   canvas: ScopeOptions["canvas"];
   update(frame: CanvasImageSource | VideoFrame | ImageData | PixelFrame | V210Frame, options?: Partial<ScopeOptions>): Promise<ScopeResult>;

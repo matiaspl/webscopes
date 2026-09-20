@@ -38,6 +38,9 @@ function mockDevice(overrides = {}) {
     copyCalls: 0,
     writeTextureCalls: 0,
     bindGroupCreates: 0,
+    externalTextureImports: [],
+    bindGroupEntries: [],
+    shaderCodes: [],
   };
   const limits = {
     maxTextureDimension2D: 8192,
@@ -48,6 +51,7 @@ function mockDevice(overrides = {}) {
     maxBindingsPerBindGroup: 8,
     maxStorageBuffersPerShaderStage: 8,
     maxSampledTexturesPerShaderStage: 16,
+    maxSamplersPerShaderStage: 8,
     maxUniformBuffersPerShaderStage: 12,
     maxBufferSize: 1 << 28,
     maxStorageBufferBindingSize: 1 << 27,
@@ -69,9 +73,10 @@ function mockDevice(overrides = {}) {
       writeBuffer() {},
       submit() {},
     },
-    createShaderModule() {
+    createShaderModule({ code }) {
       if (overrides.initializationThrows) throw new Error("synthetic initialization error");
-      return {};
+      state.shaderCodes.push(code);
+      return { code };
     },
     createComputePipeline() { return { getBindGroupLayout() { return {}; } }; },
     createTexture() {
@@ -96,9 +101,15 @@ function mockDevice(overrides = {}) {
         unmap() { state.unmaps += 1; },
       };
     },
-    createBindGroup() {
+    createBindGroup({ entries }) {
       state.bindGroupCreates += 1;
+      state.bindGroupEntries.push(entries);
       return {};
+    },
+    importExternalTexture(descriptor) {
+      if (overrides.importExternalTextureThrows) throw new Error("synthetic external-texture import error");
+      state.externalTextureImports.push(descriptor);
+      return { descriptor };
     },
     createCommandEncoder() {
       return {
@@ -232,6 +243,159 @@ test("uploads canonical RGBA pixel sources instead of using external-image conve
     assert.equal(device.state.copyCalls, 0);
     analyzer.destroy();
   } finally {
+    restore();
+  }
+});
+
+test("analyzes video through an sRGB external texture without copying the frame to CPU", async () => {
+  const restore = installGpuConstants();
+  try {
+    const device = mockDevice();
+    const analyzer = await createWebGpuAnalyzer({ device });
+    const firstFrame = { displayWidth: 2, displayHeight: 1 };
+    const secondFrame = { displayWidth: 2, displayHeight: 1 };
+    const options = { waveformWidth: 2, waveformHeight: 16, vectorscopeSize: 64 };
+
+    const first = await analyzer.analyzeVideo(firstFrame, options);
+    const second = await analyzer.analyzeVideo(secondFrame, options);
+
+    assert.equal(first.sampleCount, 2);
+    assert.equal(second.sampleCount, 2);
+    assert.deepEqual(device.state.externalTextureImports, [
+      { source: firstFrame, colorSpace: "srgb" },
+      { source: secondFrame, colorSpace: "srgb" },
+    ]);
+    assert.equal(device.state.copyCalls, 0);
+    assert.equal(device.state.writeTextureCalls, 0);
+    assert.equal(device.state.textureCreates, 0);
+    assert.equal(device.state.shaderCodes.length, 2, "the external-texture compute pipeline is created once");
+    assert.match(device.state.shaderCodes[1], /var inputTexture: texture_external;/);
+    assert.match(device.state.shaderCodes[1], /textureLoad\(inputTexture, vec2<i32>\(i32\(sourceX\), i32\(sourceY\)\)\)/);
+    assert.equal(device.state.bindGroupCreates, 2, "each per-frame external texture gets a fresh bind group");
+    analyzer.destroy();
+  } finally {
+    restore();
+  }
+});
+
+test("createScopes sends a VideoFrame snapshot to the WebGPU external-texture path", async () => {
+  const restore = installGpuConstants();
+  const previousVideoFrame = globalThis.VideoFrame;
+  const snapshots = [];
+  class FakeVideoFrame {
+    constructor(source) {
+      this.displayWidth = source.videoWidth;
+      this.displayHeight = source.videoHeight;
+      this.closed = false;
+      snapshots.push(this);
+    }
+
+    close() { this.closed = true; }
+  }
+  globalThis.VideoFrame = FakeVideoFrame;
+  try {
+    const device = mockDevice();
+    const scopes = await createScopes({ backend: "webgpu", device, autoRender: false });
+    const result = await scopes.update({ videoWidth: 2, videoHeight: 1, currentTime: 0 }, {
+      waveformWidth: 2,
+      waveformHeight: 16,
+      vectorscopeSize: 64,
+    });
+
+    assert.equal(result.stats.performance.backend, "webgpu");
+    assert.equal(snapshots.length, 1);
+    assert.equal(snapshots[0].closed, true, "the snapshot remains alive through GPU readback and is then closed");
+    assert.equal(device.state.externalTextureImports.length, 1);
+    assert.strictEqual(device.state.externalTextureImports[0].source, snapshots[0]);
+    assert.equal(device.state.copyCalls, 0);
+    assert.equal(device.state.writeTextureCalls, 0);
+    scopes.destroy();
+  } finally {
+    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+    else globalThis.VideoFrame = previousVideoFrame;
+    restore();
+  }
+});
+
+test("createScopes uses reusable texture copies for Safari video inputs by default", async () => {
+  const restore = installGpuConstants();
+  const previousVideoFrame = globalThis.VideoFrame;
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const snapshots = [];
+  class FakeVideoFrame {
+    constructor(source) {
+      this.displayWidth = source.videoWidth;
+      this.displayHeight = source.videoHeight;
+      snapshots.push(this);
+    }
+
+    close() {}
+  }
+  globalThis.VideoFrame = FakeVideoFrame;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15" },
+  });
+  try {
+    const device = mockDevice();
+    const scopes = await createScopes({ backend: "webgpu", device, autoRender: false });
+    const result = await scopes.update({ videoWidth: 2, videoHeight: 1, currentTime: 0 }, {
+      waveformWidth: 2,
+      waveformHeight: 16,
+      vectorscopeSize: 64,
+    });
+
+    assert.equal(scopes.videoTextureMode, "copy");
+    assert.equal(result.stats.performance.backend, "webgpu");
+    assert.equal(snapshots.length, 0, "Safari's copy path does not create per-frame VideoFrame snapshots");
+    assert.equal(device.state.copyCalls, 1);
+    assert.equal(device.state.externalTextureImports.length, 0);
+    assert.equal(device.state.textureCreates, 1);
+    scopes.destroy();
+  } finally {
+    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+    else globalThis.VideoFrame = previousVideoFrame;
+    if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
+    else delete globalThis.navigator;
+    restore();
+  }
+});
+
+test("Auto switches to CPU once when external video textures are unavailable", async () => {
+  const restore = installGpuConstants();
+  const previousVideoFrame = globalThis.VideoFrame;
+  const warnings = [];
+  class PixelVideoFrame {
+    constructor() {
+      this.displayWidth = 1;
+      this.displayHeight = 1;
+      this.width = 1;
+      this.height = 1;
+      this.data = new Uint8Array([255, 0, 0, 255]);
+    }
+
+    close() {}
+  }
+  globalThis.VideoFrame = PixelVideoFrame;
+  try {
+    const device = mockDevice({ importExternalTextureThrows: true });
+    const scopes = await createScopes({ backend: "auto", device, autoRender: false, onWarning: (message) => warnings.push(message) });
+    const result = await scopes.update({ videoWidth: 1, videoHeight: 1, currentTime: 0 }, {
+      waveformWidth: 1,
+      waveformHeight: 16,
+      vectorscopeSize: 64,
+    });
+
+    assert.equal(scopes.backend, "cpu");
+    assert.equal(result.stats.performance.backend, "cpu");
+    assert.equal(result.sampleCount, 1);
+    assert.equal(device.state.externalTextureImports.length, 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /switching to CPU.*external-texture import error/);
+    scopes.destroy();
+  } finally {
+    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+    else globalThis.VideoFrame = previousVideoFrame;
     restore();
   }
 });

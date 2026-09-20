@@ -3,6 +3,13 @@ import { renderScopes } from "./render.js";
 import { generateTestSignalSlate, TEST_SIGNAL_COLOR_MATRICES, TEST_SIGNAL_COLOR_RANGES, TEST_SIGNAL_PATTERNS } from "./slates.js";
 import { createWebGpuAnalyzer } from "./webgpu.js";
 
+const VIDEO_TEXTURE_MODES = new Set(["auto", "copy", "external"]);
+
+function isSafariUserAgent(userAgent = globalThis.navigator?.userAgent ?? "") {
+  return /Safari\//.test(userAgent)
+    && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Opera|FxiOS|Firefox)/i.test(userAgent);
+}
+
 export {
   analyzeFrame,
   generateTestSignalSlate,
@@ -18,12 +25,18 @@ export async function createScopes(options = {}) {
   if (!["auto", "webgpu", "cpu"].includes(requestedBackend)) {
     throw new RangeError(`Unsupported backend: ${requestedBackend}`);
   }
+  const videoTextureMode = options.videoTextureMode ?? "auto";
+  if (!VIDEO_TEXTURE_MODES.has(videoTextureMode)) {
+    throw new RangeError(`Unsupported video texture mode: ${videoTextureMode}`);
+  }
 
   let gpuAnalyzer;
   let backend = "cpu";
   if (requestedBackend !== "cpu") {
     try {
-      gpuAnalyzer = await createWebGpuAnalyzer(options);
+      const useExternalVideoTextures = videoTextureMode === "external"
+        || (videoTextureMode === "auto" && !isSafariUserAgent());
+      gpuAnalyzer = await createWebGpuAnalyzer({ ...options, useExternalVideoTextures });
       backend = "webgpu";
     } catch (error) {
       if (requestedBackend === "webgpu") throw error;
@@ -46,6 +59,7 @@ export async function createScopes(options = {}) {
     cpuCapture.context = undefined;
     cpuCapture.data = undefined;
     cpuCapture.videoFrameReadback = undefined;
+    cpuCapture.videoFramePixelFormat = undefined;
     browserSourceCapture.canvas = undefined;
     browserSourceCapture.context = undefined;
   }
@@ -67,21 +81,21 @@ export async function createScopes(options = {}) {
       let analysisSource = frame;
       let ownsAnalysisSource = false;
       let sharedCanvasCapture;
-      let sharedPixelSource;
       const isVideoFrame = typeof globalThis.VideoFrame === "function" && frame instanceof globalThis.VideoFrame;
       const isVideoSource = (typeof globalThis.HTMLVideoElement === "function" && frame instanceof globalThis.HTMLVideoElement)
         || frame?.nodeName === "VIDEO"
         || frame?.tagName === "VIDEO"
         || (Number.isFinite(frame?.videoWidth) && Number.isFinite(frame?.videoHeight) && Number.isFinite(frame?.currentTime));
-      if (!rawPixels && useGpu && isVideoSource) {
+      const isVideoInput = isVideoFrame || isVideoSource;
+      const copyVideoToReusableCanvas = useGpu && gpuAnalyzer.videoTextureMode === "copy" && isVideoInput;
+      if (!rawPixels && copyVideoToReusableCanvas) {
         try {
-          sharedPixelSource = await readFramePixelsAsync(frame, cpuCapture);
-          analysisSource = sharedPixelSource;
+          const browserSource = captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" });
+          analysisSource = browserSource.canvas;
         } catch {
-          // Keep the browser source when a video cannot be read back as RGBA.
+          // Keep the browser source when a canvas snapshot is unavailable.
         }
-      }
-      if (!rawPixels && !sharedPixelSource && typeof globalThis.VideoFrame === "function" && !isVideoFrame) {
+      } else if (!rawPixels && typeof globalThis.VideoFrame === "function" && !isVideoFrame) {
         try {
           analysisSource = new globalThis.VideoFrame(frame, { timestamp: 0 });
           ownsAnalysisSource = true;
@@ -89,7 +103,7 @@ export async function createScopes(options = {}) {
           // Keep the original source when this browser cannot snapshot it as a VideoFrame.
         }
       }
-      if (!rawPixels && !sharedPixelSource && !ownsAnalysisSource && !isVideoFrame) {
+      if (!rawPixels && !copyVideoToReusableCanvas && !ownsAnalysisSource && !isVideoFrame && !(useGpu && isVideoSource)) {
         try {
           const browserSource = captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" });
           sharedCanvasCapture = captureFrameToCanvas(browserSource.canvas, cpuCapture, { willReadFrequently: false, colorSpace: "srgb" });
@@ -101,7 +115,9 @@ export async function createScopes(options = {}) {
       try {
         if (useGpu) {
           try {
-            nextResult = await gpuAnalyzer.analyze(analysisSource, frameOptions);
+            nextResult = isVideoInput
+              ? await gpuAnalyzer.analyzeVideo(analysisSource, frameOptions)
+              : await gpuAnalyzer.analyze(analysisSource, frameOptions);
           } catch (error) {
             if (destroyed) throw new Error("Scope analyzer has been destroyed");
             if (requestedBackend !== "auto" || backend !== "webgpu") throw error;
@@ -111,19 +127,17 @@ export async function createScopes(options = {}) {
             backend = "cpu";
             frameBackend = "cpu";
             nextResult = analyzeFrame(
-              sharedPixelSource
-                ?? (sharedCanvasCapture
-                  ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
-                  : await readFramePixelsAsync(analysisSource, cpuCapture)),
+              sharedCanvasCapture
+                ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
+                : await readFramePixelsAsync(analysisSource, cpuCapture),
               frameOptions,
             );
           }
         } else {
           nextResult = analyzeFrame(
-            sharedPixelSource
-              ?? (sharedCanvasCapture
-                ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
-                : await readFramePixelsAsync(analysisSource, cpuCapture)),
+            sharedCanvasCapture
+              ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
+              : await readFramePixelsAsync(analysisSource, cpuCapture),
             frameOptions,
           );
         }
@@ -170,6 +184,7 @@ export async function createScopes(options = {}) {
 
   return {
     get backend() { return backend; },
+    get videoTextureMode() { return gpuAnalyzer?.videoTextureMode; },
     get result() { return currentResult; },
     get canvas() { return canvas; },
     set canvas(value) { canvas = value; },

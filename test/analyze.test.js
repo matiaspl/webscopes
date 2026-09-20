@@ -90,7 +90,7 @@ test("createScopes applies per-frame input resolution scaling", async () => {
   scopes.destroy();
 });
 
-test("real-time CPU analysis reuses a WebCodecs RGBA buffer", async () => {
+test("real-time analysis reuses an opaque WebCodecs RGBX buffer", async () => {
   const previousVideoFrame = globalThis.VideoFrame;
   const destinations = [];
   class FakeVideoFrame {
@@ -99,10 +99,16 @@ test("real-time CPU analysis reuses a WebCodecs RGBA buffer", async () => {
       this.displayHeight = 1;
     }
 
+    allocationSize(options) {
+      assert.equal(options.format, "RGBX");
+      assert.equal(Object.hasOwn(options, "layout"), false);
+      return 8;
+    }
+
     async copyTo(destination, options) {
-      assert.equal(options.format, "RGBA");
+      assert.equal(options.format, "RGBX");
       destinations.push(destination);
-      destination.set([255, 0, 0, 255, 0, 255, 0, 255]);
+      destination.set([255, 0, 0, 0, 0, 255, 0, 0]);
     }
 
     close() {}
@@ -116,6 +122,41 @@ test("real-time CPU analysis reuses a WebCodecs RGBA buffer", async () => {
     assert.equal(first.height, 1);
     assert.strictEqual(first.data, second.data);
     assert.strictEqual(destinations[0], destinations[1]);
+    assert.equal(capture.videoFramePixelFormat, "RGBX");
+  } finally {
+    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+    else globalThis.VideoFrame = previousVideoFrame;
+  }
+});
+
+test("falls back to opaque RGBA when WebCodecs does not support RGBX", async () => {
+  const previousVideoFrame = globalThis.VideoFrame;
+  const attemptedFormats = [];
+  class RgbaOnlyVideoFrame {
+    constructor() {
+      this.displayWidth = 1;
+      this.displayHeight = 1;
+    }
+
+    allocationSize({ format }) {
+      attemptedFormats.push(format);
+      return 4;
+    }
+
+    async copyTo(destination, { format }) {
+      if (format === "RGBX") throw new TypeError("Unsupported pixel format");
+      destination.set([12, 34, 56, 255]);
+    }
+
+    close() {}
+  }
+  globalThis.VideoFrame = RgbaOnlyVideoFrame;
+  try {
+    const capture = {};
+    const result = await readFramePixelsAsync({ videoWidth: 1, videoHeight: 1 }, capture);
+    assert.deepEqual([...result.data], [12, 34, 56, 255]);
+    assert.deepEqual(attemptedFormats, ["RGBX", "RGBA"]);
+    assert.equal(capture.videoFramePixelFormat, "RGBA");
   } finally {
     if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
     else globalThis.VideoFrame = previousVideoFrame;
@@ -131,7 +172,8 @@ test("falls back when VideoFrame RGBA readback is malformed", async () => {
       this.displayHeight = 1;
     }
 
-    async copyTo(destination) {
+    async copyTo(destination, { format }) {
+      if (format === "RGBX") throw new TypeError("Unsupported pixel format");
       destination.set([10, 20, 30, 0, 40, 50, 60, 0]);
     }
 

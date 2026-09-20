@@ -103,6 +103,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 `;
 
+const EXTERNAL_COMPUTE_SHADER = COMPUTE_SHADER
+  .replace("var inputTexture: texture_2d<f32>;", "var inputTexture: texture_external;")
+  .replace(
+    "textureLoad(inputTexture, vec2<i32>(i32(sourceX), i32(sourceY)), 0)",
+    "textureLoad(inputTexture, vec2<i32>(i32(sourceX), i32(sourceY)))",
+  );
+
 function gpuMode(mode) {
   if (mode === "luma") return 1;
   if (mode === "ycbcr-parade") return 2;
@@ -112,6 +119,7 @@ function gpuMode(mode) {
 
 export async function createWebGpuAnalyzer(options = {}) {
   let device = options.device;
+  const useExternalVideoTextures = options.useExternalVideoTextures ?? true;
   let ownsDevice = false;
   let texture;
   let textureView;
@@ -280,9 +288,29 @@ export async function createWebGpuAnalyzer(options = {}) {
     const bindGroupLayout = pipeline.getBindGroupLayout(0);
     const parameterBytes = new ArrayBuffer(64);
     const parameterView = new DataView(parameterBytes);
+    let externalPipeline;
     throwIfDeviceLost();
 
-    async function analyze(source, analysisOptions = {}) {
+    async function ensureExternalPipeline() {
+      if (externalPipeline) return externalPipeline;
+      const { pipeline: nextPipeline } = await withValidationScope(() => {
+        const shaderModule = device.createShaderModule({
+          code: EXTERNAL_COMPUTE_SHADER,
+          label: "webscopes external-video histogram compute",
+        });
+        return {
+          pipeline: device.createComputePipeline({
+            label: "webscopes external-video histogram pipeline",
+            layout: "auto",
+            compute: { module: shaderModule, entryPoint: "main" },
+          }),
+        };
+      });
+      externalPipeline = nextPipeline;
+      return externalPipeline;
+    }
+
+    async function analyze(source, analysisOptions = {}, externalVideo = false) {
       const task = inFlight.then(async () => {
         if (destroyed) throw new Error("WebGPU analyzer has been destroyed");
         throwIfDeviceLost();
@@ -298,6 +326,17 @@ export async function createWebGpuAnalyzer(options = {}) {
         const binCount = vectorArea + channelArea * channelCount;
         const byteLength = binCount * Uint32Array.BYTES_PER_ELEMENT;
         validateLimits(width, height, config, byteLength);
+        if (externalVideo) {
+          if (typeof device.importExternalTexture !== "function") {
+            throw new Error("This WebGPU device does not support external video textures");
+          }
+          if (limit(device.limits, "maxSampledTexturesPerShaderStage") < 4
+            || limit(device.limits, "maxSamplersPerShaderStage") < 1
+            || limit(device.limits, "maxUniformBuffersPerShaderStage") < 2) {
+            throw new RangeError("GPU device limits do not support external video textures in the histogram shader");
+          }
+        }
+        const activePipeline = externalVideo ? await ensureExternalPipeline() : pipeline;
 
         const matrix = getColorMatrix(colorMatrix);
         const words = [width, height, waveformWidth, waveformHeight, gpuMode(waveformMode), x0, y0, cropWidth, cropHeight, vectorscopeSize, sampleWidth, sampleHeight];
@@ -307,36 +346,52 @@ export async function createWebGpuAnalyzer(options = {}) {
         parameterView.setUint32(56, 1024, true);
 
         await withValidationScope(() => {
-          ensureTexture(width, height);
-          if (isRgbaPixelSource(source)) {
-            device.queue.writeTexture(
-              { texture },
-              source.data,
-              { bytesPerRow: width * 4, rowsPerImage: height },
-              { width, height, depthOrArrayLayers: 1 },
-            );
+          let activeBindGroup;
+          if (externalVideo) {
+            ensureBuffers(byteLength);
+            device.queue.writeBuffer(paramsBuffer, 0, parameterBytes);
+            const externalTexture = device.importExternalTexture({ source, colorSpace: "srgb" });
+            activeBindGroup = device.createBindGroup({
+              layout: activePipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: externalTexture },
+                { binding: 1, resource: { buffer: binsBuffer } },
+                { binding: 2, resource: { buffer: paramsBuffer } },
+              ],
+            });
           } else {
-            device.queue.copyExternalImageToTexture(
-              { source },
-              { texture, colorSpace: "srgb", premultipliedAlpha: false },
-              { width, height },
-            );
+            ensureTexture(width, height);
+            if (isRgbaPixelSource(source)) {
+              device.queue.writeTexture(
+                { texture },
+                source.data,
+                { bytesPerRow: width * 4, rowsPerImage: height },
+                { width, height, depthOrArrayLayers: 1 },
+              );
+            } else {
+              device.queue.copyExternalImageToTexture(
+                { source },
+                { texture, colorSpace: "srgb", premultipliedAlpha: false },
+                { width, height },
+              );
+            }
+            ensureBuffers(byteLength);
+            device.queue.writeBuffer(paramsBuffer, 0, parameterBytes);
+            if (!bindGroup) bindGroup = device.createBindGroup({
+              layout: bindGroupLayout,
+              entries: [
+                { binding: 0, resource: textureView },
+                { binding: 1, resource: { buffer: binsBuffer } },
+                { binding: 2, resource: { buffer: paramsBuffer } },
+              ],
+            });
+            activeBindGroup = bindGroup;
           }
-          ensureBuffers(byteLength);
-          device.queue.writeBuffer(paramsBuffer, 0, parameterBytes);
-          if (!bindGroup) bindGroup = device.createBindGroup({
-            layout: bindGroupLayout,
-            entries: [
-              { binding: 0, resource: textureView },
-              { binding: 1, resource: { buffer: binsBuffer } },
-              { binding: 2, resource: { buffer: paramsBuffer } },
-            ],
-          });
           const encoder = device.createCommandEncoder({ label: "webscopes analyze frame" });
           encoder.clearBuffer(binsBuffer);
           const pass = encoder.beginComputePass();
-          pass.setPipeline(pipeline);
-          pass.setBindGroup(0, bindGroup);
+          pass.setPipeline(activePipeline);
+          pass.setBindGroup(0, activeBindGroup);
           pass.dispatchWorkgroups(Math.ceil(sampleWidth / 8), Math.ceil(sampleHeight / 8));
           pass.end();
           encoder.copyBufferToBuffer(binsBuffer, 0, stagingBuffer, 0, byteLength);
@@ -394,7 +449,9 @@ export async function createWebGpuAnalyzer(options = {}) {
 
     return {
       device,
-      analyze,
+      videoTextureMode: useExternalVideoTextures ? "external" : "copy",
+      analyze: (source, analysisOptions) => analyze(source, analysisOptions, false),
+      analyzeVideo: (source, analysisOptions) => analyze(source, analysisOptions, useExternalVideoTextures),
       destroy() {
         if (destroyed) return;
         destroyed = true;

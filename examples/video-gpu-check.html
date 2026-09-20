@@ -14,9 +14,10 @@
 </head>
 <body>
   <h1>webscopes: real video CPU/GPU check</h1>
-  <pre id="status">Loading a decoded HLS video frame…</pre>
+  <button id="run-check" type="button" disabled>Loading test video…</button>
+  <pre id="status">Loading a decoded HLS source. The test compares exact CPU/GPU scope bins, then runs the selected video-path soak and records memory telemetry where available.</pre>
   <video id="video" muted playsinline crossorigin="anonymous"></video>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
-  <script type="module" src="./video-gpu-check.js"></script>
+  <script type="module" src="./video-gpu-check.js?probe=browser-memory-validation-v4"></script>
 </body>
 </html>
