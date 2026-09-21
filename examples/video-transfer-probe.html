@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Video import transfer probe</title>
+<style>body{font:14px monospace;max-width:1200px;margin:20px auto}pre{white-space:pre-wrap}video{width:480px}</style>
+<h1>Video import transfer probe</h1>
+<p>Compares an external texture with Canvas2D on one frozen frame, then repeats with a software copy of its planes. Errors use 8-bit code units. The experimental Apple transfer correction runs inside WGSL.</p>
+<p>After running <code>python3 scripts/generate-video-transfer-slate.py</code>, test the
+<a href="?slate=1&amp;source=/dist/video-transfer-slate/bt709.m3u8">BT.709 slate</a> or the
+<a href="?slate=1&amp;source=/dist/video-transfer-slate/srgb.m3u8">identical sRGB-tagged control</a>.
+The four rows are a neutral code ramp, shadow steps, vertical Cb edges, and horizontal Cr edges.</p>
+<button id="run">Measure frozen HLS frame</button>
+<video id="video" muted playsinline crossorigin="anonymous"></video>
+<pre id="status">Ready</pre>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script type="module" src="./video-transfer-probe.js?v=5"></script>
+</html>

@@ -49,7 +49,7 @@ export interface TestSignalSlate {
 
 export interface ScopeOptions {
   backend?: BackendName;
-  /** Video input path for WebGPU. "auto" uses reusable texture copies on Safari and external textures elsewhere. */
+  /** Video input path for WebGPU. "auto" uses an sRGB canvas and reusable texture copies for CPU color parity. "external" qualifies each frame against canvas and uses corrected linear sampling when a known transfer matches; otherwise it falls back to canvas. */
   videoTextureMode?: "auto" | "copy" | "external";
   canvas?: HTMLCanvasElement | OffscreenCanvas | CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
   autoRender?: boolean;
@@ -115,6 +115,8 @@ export interface ScopeResult {
   };
   vectorscope: { width: number; height: number; bins: Uint32Array; colorMatrix: ColorMatrixName };
   stats: {
+    /** Actual WebGPU video color path for this frame. */
+    videoColorMode?: "canvas" | "external-identity" | "external-apple";
     clippedLow?: number;
     clippedHigh?: number;
     colorMatrix: ColorMatrixName;
@@ -146,7 +148,7 @@ export interface ScopeResult {
 
 export interface Scopes {
   readonly backend: "webgpu" | "cpu";
-  /** Selected WebGPU video input path; undefined when the instance uses CPU. */
+  /** Configured WebGPU video import policy; an external frame may fall back to canvas. See result.stats.videoColorMode for the actual path. Undefined on CPU. */
   readonly videoTextureMode: "copy" | "external" | undefined;
   readonly result: ScopeResult | undefined;
   canvas: ScopeOptions["canvas"];
@@ -180,7 +182,7 @@ export interface ScopeDisplayMetadata {
     channelCount: number;
   };
   vectorscope: { width: number; height: number; colorMatrix: ColorMatrixName };
-  stats: { colorMatrix: ColorMatrixName; bitDepth: 8 | 10 | 12 };
+  stats: { colorMatrix: ColorMatrixName; bitDepth: 8 | 10 | 12; videoColorMode?: "canvas" | "external-identity" | "external-apple" };
 }
 
 export type ScopeDisplayPresentResult =

@@ -15,10 +15,15 @@ function installGpuConstants() {
     GPUTextureUsage: globalThis.GPUTextureUsage,
     GPUBufferUsage: globalThis.GPUBufferUsage,
     GPUMapMode: globalThis.GPUMapMode,
+    OffscreenCanvas: globalThis.OffscreenCanvas,
   };
   globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2, RENDER_ATTACHMENT: 4 };
   globalThis.GPUBufferUsage = { STORAGE: 1, COPY_SRC: 2, COPY_DST: 4, MAP_READ: 8, UNIFORM: 16 };
   globalThis.GPUMapMode = { READ: 1 };
+  globalThis.OffscreenCanvas = class {
+    constructor(width, height) { this.width = width; this.height = height; }
+    getContext() { return { drawImage() {}, getImageData: () => ({ data: new Uint8ClampedArray(Array.from({length: this.width * this.height * 4}, (_, i) => i % 4 === 3 ? 255 : 128)) }) }; }
+  };
   return () => {
     for (const [name, value] of Object.entries(original)) {
       if (value === undefined) delete globalThis[name];
@@ -78,6 +83,7 @@ function mockDevice(overrides = {}) {
       state.shaderCodes.push(code);
       return { code };
     },
+    createSampler() { return {}; },
     createComputePipeline() { return { getBindGroupLayout() { return {}; } }; },
     createTexture() {
       state.textureCreates += 1;
@@ -96,6 +102,9 @@ function mockDevice(overrides = {}) {
         },
         getMappedRange() {
           if (overrides.rangeThrows) throw new Error("synthetic mapped range error");
+          if (size === 2048) {
+            return (overrides.probeSamples?.() ?? new Float32Array(Array.from({length: 512}, (_, i) => i % 8 < 4 ? 140 / 255 : 128 / 255))).buffer;
+          }
           return new ArrayBuffer(size);
         },
         unmap() { state.unmaps += 1; },
@@ -131,10 +140,15 @@ test("defers WebGPU resource destruction until an in-flight readback is unmapped
     GPUTextureUsage: globalThis.GPUTextureUsage,
     GPUBufferUsage: globalThis.GPUBufferUsage,
     GPUMapMode: globalThis.GPUMapMode,
+    OffscreenCanvas: globalThis.OffscreenCanvas,
   };
   globalThis.GPUTextureUsage = { TEXTURE_BINDING: 1, COPY_DST: 2, RENDER_ATTACHMENT: 4 };
   globalThis.GPUBufferUsage = { STORAGE: 1, COPY_SRC: 2, COPY_DST: 4, MAP_READ: 8, UNIFORM: 16 };
   globalThis.GPUMapMode = { READ: 1 };
+  globalThis.OffscreenCanvas = class {
+    constructor(width, height) { this.width = width; this.height = height; }
+    getContext() { return { drawImage() {}, getImageData: () => ({ data: new Uint8ClampedArray(Array.from({length: this.width * this.height * 4}, (_, i) => i % 4 === 3 ? 255 : 128)) }) }; }
+  };
 
   const mapStarted = deferred();
   const releaseMap = deferred();
@@ -247,13 +261,13 @@ test("uploads canonical RGBA pixel sources instead of using external-image conve
   }
 });
 
-test("analyzes video through an sRGB external texture without copying the frame to CPU", async () => {
+test("qualifies every external video frame and binds the corrected linear sampler", async () => {
   const restore = installGpuConstants();
   try {
     const device = mockDevice();
     const analyzer = await createWebGpuAnalyzer({ device });
-    const firstFrame = { displayWidth: 2, displayHeight: 1 };
-    const secondFrame = { displayWidth: 2, displayHeight: 1 };
+    const firstFrame = { displayWidth: 2, displayHeight: 1, format: "NV12", colorSpace: {primaries: "bt709", matrix: "bt709", transfer: "bt709", fullRange: false} };
+    const secondFrame = { ...firstFrame };
     const options = { waveformWidth: 2, waveformHeight: 16, vectorscopeSize: 64 };
 
     const first = await analyzer.analyzeVideo(firstFrame, options);
@@ -263,15 +277,18 @@ test("analyzes video through an sRGB external texture without copying the frame 
     assert.equal(second.sampleCount, 2);
     assert.deepEqual(device.state.externalTextureImports, [
       { source: firstFrame, colorSpace: "srgb" },
+      { source: firstFrame, colorSpace: "srgb" },
+      { source: secondFrame, colorSpace: "srgb" },
       { source: secondFrame, colorSpace: "srgb" },
     ]);
     assert.equal(device.state.copyCalls, 0);
     assert.equal(device.state.writeTextureCalls, 0);
     assert.equal(device.state.textureCreates, 0);
-    assert.equal(device.state.shaderCodes.length, 2, "the external-texture compute pipeline is created once");
-    assert.match(device.state.shaderCodes[1], /var inputTexture: texture_external;/);
-    assert.match(device.state.shaderCodes[1], /textureLoad\(inputTexture, vec2<i32>\(i32\(sourceX\), i32\(sourceY\)\)\)/);
-    assert.equal(device.state.bindGroupCreates, 2, "each per-frame external texture gets a fresh bind group");
+    assert.equal(device.state.shaderCodes.length, 3, "probe and histogram pipelines are each created once");
+    assert.match(device.state.shaderCodes[2], /var inputTexture: texture_external;/);
+    assert.match(device.state.shaderCodes[2], /textureSampleBaseClampToEdge/);
+    assert.match(device.state.shaderCodes[2], /undoAppleTransfer/);
+    assert.equal(device.state.bindGroupCreates, 4, "each frame gets fresh probe and histogram bindings");
     analyzer.destroy();
   } finally {
     restore();
@@ -286,6 +303,8 @@ test("createScopes sends a VideoFrame snapshot to the WebGPU external-texture pa
     constructor(source) {
       this.displayWidth = source.videoWidth;
       this.displayHeight = source.videoHeight;
+      this.format = "NV12";
+      this.colorSpace = {primaries: "bt709", matrix: "bt709", transfer: "bt709", fullRange: false};
       this.closed = false;
       snapshots.push(this);
     }
@@ -295,7 +314,7 @@ test("createScopes sends a VideoFrame snapshot to the WebGPU external-texture pa
   globalThis.VideoFrame = FakeVideoFrame;
   try {
     const device = mockDevice();
-    const scopes = await createScopes({ backend: "webgpu", device, autoRender: false });
+    const scopes = await createScopes({ backend: "webgpu", device, autoRender: false, videoTextureMode: "external" });
     const result = await scopes.update({ videoWidth: 2, videoHeight: 1, currentTime: 0 }, {
       waveformWidth: 2,
       waveformHeight: 16,
@@ -305,7 +324,7 @@ test("createScopes sends a VideoFrame snapshot to the WebGPU external-texture pa
     assert.equal(result.stats.performance.backend, "webgpu");
     assert.equal(snapshots.length, 1);
     assert.equal(snapshots[0].closed, true, "the snapshot remains alive through GPU readback and is then closed");
-    assert.equal(device.state.externalTextureImports.length, 1);
+    assert.equal(device.state.externalTextureImports.length, 2);
     assert.strictEqual(device.state.externalTextureImports[0].source, snapshots[0]);
     assert.equal(device.state.copyCalls, 0);
     assert.equal(device.state.writeTextureCalls, 0);
@@ -396,6 +415,7 @@ test("createScopes times source capture and keeps failed GPU work in the CPU fal
     scopes = await createScopes({
       backend: "auto",
       device: mockDevice({ mapStarted, mapGate, mapThrows: true }),
+      videoTextureMode: "external",
       autoRender: false,
     });
     const pending = scopes.update({ videoWidth: 1, videoHeight: 1, currentTime: 0 });
@@ -420,51 +440,53 @@ test("createScopes times source capture and keeps failed GPU work in the CPU fal
   }
 });
 
-test("createScopes uses reusable texture copies for Safari video inputs by default", async () => {
-  const restore = installGpuConstants();
-  const previousVideoFrame = globalThis.VideoFrame;
-  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
-  const snapshots = [];
-  class FakeVideoFrame {
-    constructor(source) {
-      this.displayWidth = source.videoWidth;
-      this.displayHeight = source.videoHeight;
-      snapshots.push(this);
+for (const browser of ["Safari/605.1.15", "Chrome/140.0.0.0 Safari/537.36"]) {
+  test(`createScopes defaults to reusable texture copies for ${browser}`, async () => {
+    const restore = installGpuConstants();
+    const previousVideoFrame = globalThis.VideoFrame;
+    const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const snapshots = [];
+    class FakeVideoFrame {
+      constructor(source) {
+        this.displayWidth = source.videoWidth;
+        this.displayHeight = source.videoHeight;
+        snapshots.push(this);
+      }
+
+      close() {}
     }
-
-    close() {}
-  }
-  globalThis.VideoFrame = FakeVideoFrame;
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    value: { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15" },
-  });
-  try {
-    const device = mockDevice();
-    const scopes = await createScopes({ backend: "webgpu", device, autoRender: false });
-    const result = await scopes.update({ videoWidth: 2, videoHeight: 1, currentTime: 0 }, {
-      waveformWidth: 2,
-      waveformHeight: 16,
-      vectorscopeSize: 64,
+    globalThis.VideoFrame = FakeVideoFrame;
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: { userAgent: browser },
     });
+    try {
+      const device = mockDevice();
+      const scopes = await createScopes({ backend: "webgpu", device, autoRender: false });
+      const result = await scopes.update({ videoWidth: 2, videoHeight: 1, currentTime: 0 }, {
+        waveformWidth: 2,
+        waveformHeight: 16,
+        vectorscopeSize: 64,
+      });
 
-    assert.equal(scopes.videoTextureMode, "copy");
-    assert.equal(result.stats.performance.backend, "webgpu");
-    assert.equal(snapshots.length, 0, "Safari's copy path does not create per-frame VideoFrame snapshots");
-    assert.equal(device.state.copyCalls, 1);
-    assert.equal(device.state.externalTextureImports.length, 0);
-    assert.equal(device.state.textureCreates, 1);
-    scopes.destroy();
-  } finally {
-    if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
-    else globalThis.VideoFrame = previousVideoFrame;
-    if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
-    else delete globalThis.navigator;
-    restore();
-  }
-});
+      assert.equal(scopes.videoTextureMode, "copy");
+      assert.equal(result.stats.performance.backend, "webgpu");
+      assert.equal(snapshots.length, 0, "the copy path does not create per-frame VideoFrame snapshots");
+      assert.equal(device.state.copyCalls, 1);
+      assert.equal(device.state.externalTextureImports.length, 0);
+      assert.equal(device.state.textureCreates, 1);
+      scopes.destroy();
+    } finally {
+      if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
+      else globalThis.VideoFrame = previousVideoFrame;
+      if (previousNavigator) Object.defineProperty(globalThis, "navigator", previousNavigator);
+      else delete globalThis.navigator;
+      restore();
+    }
+  });
+}
 
-test("Auto switches to CPU once when external video textures are unavailable", async () => {
+test("Auto switches to CPU once when a video fallback cannot be captured", async () => {
   const restore = installGpuConstants();
   const previousVideoFrame = globalThis.VideoFrame;
   const warnings = [];
@@ -482,7 +504,7 @@ test("Auto switches to CPU once when external video textures are unavailable", a
   globalThis.VideoFrame = PixelVideoFrame;
   try {
     const device = mockDevice({ importExternalTextureThrows: true });
-    const scopes = await createScopes({ backend: "auto", device, autoRender: false, onWarning: (message) => warnings.push(message) });
+    const scopes = await createScopes({ backend: "auto", device, autoRender: false, videoTextureMode: "external", onWarning: (message) => warnings.push(message) });
     const result = await scopes.update({ videoWidth: 1, videoHeight: 1, currentTime: 0 }, {
       waveformWidth: 1,
       waveformHeight: 16,
@@ -494,7 +516,7 @@ test("Auto switches to CPU once when external video textures are unavailable", a
     assert.equal(result.sampleCount, 1);
     assert.equal(device.state.externalTextureImports.length, 0);
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /switching to CPU.*external-texture import error/);
+    assert.match(warnings[0], /switching to CPU.*Raw pixel frames/);
     scopes.destroy();
   } finally {
     if (previousVideoFrame === undefined) delete globalThis.VideoFrame;
@@ -668,4 +690,21 @@ test("destroying during pending analysis never publishes or renders the result",
   } finally {
     restore();
   }
+});
+
+
+test("external qualification failure uses the canvas path without demoting WebGPU", async () => {
+  const restore = installGpuConstants();
+  let analyzer;
+  try {
+    const device = mockDevice({probeSamples: () => new Float32Array(512)});
+    analyzer = await createWebGpuAnalyzer({device});
+    const source = {nodeName: "VIDEO", displayWidth: 2, displayHeight: 1, format: "NV12",
+      colorSpace: {primaries: "bt709", matrix: "bt709", transfer: "bt709", fullRange: false}};
+    const result = await analyzer.analyzeVideo(source, {waveformWidth: 2, waveformHeight: 16, vectorscopeSize: 64});
+    assert.equal(result.stats.videoColorMode, "canvas");
+    assert.equal(device.state.externalTextureImports.length, 1, "only the probe imports externally");
+    assert.equal(device.state.copyCalls, 1);
+    assert.equal(device.state.textureCreates, 1);
+  } finally { analyzer?.destroy(); restore(); }
 });

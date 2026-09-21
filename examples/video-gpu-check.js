@@ -1,7 +1,8 @@
-import { createScopes } from "../src/index.js?video-memory-validation-v2";
+import { createScopeDisplay, createScopes } from "../src/index.js?video-color-parity-v6";
 
-const MANIFEST = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
 const query = new URLSearchParams(globalThis.location.search);
+const MANIFEST = query.get("source") || "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+const SEEK_SECONDS = Number(query.get("seek") ?? 30);
 const requestedSoakDuration = Number(query.get("soakMs"));
 const SOAK_DURATION_MS = Number.isInteger(requestedSoakDuration) && requestedSoakDuration > 0 && requestedSoakDuration <= 120_000
   ? requestedSoakDuration
@@ -153,15 +154,28 @@ try {
     runButton.disabled = true;
     let cpu;
     let gpu;
+    let display;
     let parityFrame;
     try {
+      video.loop = true;
       await video.play();
+      await waitForNextVideoFrame();
+      if (Number.isFinite(SEEK_SECONDS) && SEEK_SECONDS > 0 && Number.isFinite(video.duration)) {
+        await new Promise((resolve) => {
+          video.addEventListener("seeked", resolve, { once: true });
+          video.currentTime = Math.min(SEEK_SECONDS, video.duration * 0.5);
+        });
+      }
       await waitForNextVideoFrame();
       const source = { width: video.videoWidth, height: video.videoHeight, time: video.currentTime };
       parityFrame = new globalThis.VideoFrame(video, { timestamp: Math.round(video.currentTime * 1_000_000) });
       const rgbxReadback = await probeVideoFrameRgbx(parityFrame);
       cpu = await createScopes({ backend: "cpu", autoRender: false });
       gpu = await createScopes({ backend: "webgpu", autoRender: false, videoTextureMode: REQUESTED_VIDEO_TEXTURE_MODE });
+      const displayCanvas = document.createElement("canvas");
+      displayCanvas.width = 640;
+      displayCanvas.height = 360;
+      display = await createScopeDisplay({ canvas: displayCanvas, videoTextureMode: REQUESTED_VIDEO_TEXTURE_MODE });
       const videoTextureMode = gpu.videoTextureMode;
       const cases = [
         ["rgb-parade", "bt709"],
@@ -170,21 +184,48 @@ try {
         ["rgb-parade", "bt2020"],
       ];
       const failures = [];
+      const colorModes = [];
       for (const [waveformMode, colorMatrix] of cases) {
         const caseOptions = { ...options, waveformMode, colorMatrix };
         const cpuResult = await cpu.update(parityFrame, caseOptions);
         const gpuResult = await gpu.update(parityFrame, caseOptions);
         const comparison = compareBins(cpuResult, gpuResult);
+        await display.present(parityFrame, caseOptions);
+        const displayResult = await display.snapshot();
+        const displayComparison = compareBins(cpuResult, displayResult);
+        colorModes.push({ waveformMode, analyzer: gpuResult.stats.videoColorMode, display: displayResult.stats.videoColorMode });
         const cpuSamples = cpuResult.waveform.channels.map(sum);
         const gpuSamples = gpuResult.waveform.channels.map(sum);
         const passed = comparison.totalAbsoluteDifference === 0
+          && displayComparison.totalAbsoluteDifference === 0
           && cpuResult.sampleCount === gpuResult.sampleCount
           && cpuSamples.every((value) => value === cpuResult.sampleCount)
           && gpuSamples.every((value) => value === gpuResult.sampleCount)
           && sum(cpuResult.vectorscope.bins) === cpuResult.sampleCount
           && sum(gpuResult.vectorscope.bins) === gpuResult.sampleCount;
-        const result = { waveformMode, colorMatrix, passed, ...comparison, cpuSampleCount: cpuResult.sampleCount, gpuSampleCount: gpuResult.sampleCount };
+        const result = { waveformMode, colorMatrix, passed, ...comparison, displayComparison, cpuSampleCount: cpuResult.sampleCount, gpuSampleCount: gpuResult.sampleCount };
         if (!passed) failures.push(result);
+      }
+      if (query.get("software") === "1") {
+        const raw = new Uint8Array(parityFrame.allocationSize());
+        const layout = await parityFrame.copyTo(raw);
+        const software = new VideoFrame(raw, { format: parityFrame.format, codedWidth: parityFrame.codedWidth,
+          codedHeight: parityFrame.codedHeight, visibleRect: parityFrame.visibleRect,
+          displayWidth: parityFrame.displayWidth, displayHeight: parityFrame.displayHeight,
+          timestamp: 0, colorSpace: parityFrame.colorSpace.toJSON(), layout });
+        try {
+          // Reuse the same analyzers across hardware -> software -> hardware.
+          for (const [label, input] of [["software", software], ["hardware-again", parityFrame]]) {
+            const cpuResult = await cpu.update(input, options);
+            const gpuResult = await gpu.update(input, options);
+            await display.present(input, options);
+            const displayResult = await display.snapshot();
+            const comparison = compareBins(cpuResult, gpuResult);
+            const displayComparison = compareBins(cpuResult, displayResult);
+            colorModes.push({label, analyzer: gpuResult.stats.videoColorMode, display: displayResult.stats.videoColorMode});
+            if (comparison.totalAbsoluteDifference || displayComparison.totalAbsoluteDifference) failures.push({label, comparison, displayComparison});
+          }
+        } finally { software.close(); }
       }
       const passed = failures.length === 0;
       parityFrame.close();
@@ -192,12 +233,15 @@ try {
       status.textContent = [
         `PASS: ${passed}`,
         `Cases: ${cases.length}; failures: ${failures.length}`,
+        `Color paths: ${JSON.stringify(colorModes)}`,
         `Video: ${source.width}×${source.height} at ${source.time.toFixed(3)}s`,
         `RGBX readback: ${JSON.stringify(rgbxReadback)}`,
-        `Parity passed. Starting a ${SOAK_DURATION_MS / 1_000}s ${SOAK_PATH} soak (video texture mode: ${gpu.videoTextureMode})…`,
+        `Parity ${passed ? "passed" : "failed"}. Starting a ${SOAK_DURATION_MS / 1_000}s ${SOAK_PATH} soak (video texture mode: ${gpu.videoTextureMode})…`,
         `Source: ${MANIFEST}`,
         failures.map((failure) => JSON.stringify(failure)).join("\n"),
       ].filter(Boolean).join("\n");
+      if (video.ended) video.currentTime = 0;
+      await video.play();
       const soakStartedAt = performance.now();
       let soakFrames = 0;
       let lastProgressAt = soakStartedAt;
@@ -252,6 +296,7 @@ try {
         gpuBackend: gpu.backend,
         rgbxReadback,
         cases: cases.length,
+        colorModes,
         failures,
         soak,
         soakPath: SOAK_PATH,
@@ -262,6 +307,7 @@ try {
       status.textContent = [
         `PARITY PASS: ${passed}`,
         `Cases: ${cases.length}; failures: ${failures.length}`,
+        `Color paths: ${JSON.stringify(colorModes)}`,
         `Backends: CPU=${cpu.backend}; GPU=${gpu.backend}`,
         `Soak: ${SOAK_PATH}; WebGPU video texture mode=${videoTextureMode}; ${soak.durationMs}ms; ${soak.frames} frames`,
         memory,
@@ -284,6 +330,7 @@ try {
       video.pause();
       cpu?.destroy();
       gpu?.destroy();
+      await display?.destroy();
       hls?.destroy();
       if (window.webscopesVideoParityResult?.heapMemory?.available) {
         await new Promise((resolve) => setTimeout(resolve, 2_000));

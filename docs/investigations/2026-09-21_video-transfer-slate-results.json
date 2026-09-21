@@ -1,0 +1,140 @@
+{
+  "date": "2026-09-21",
+  "browserUserAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
+  "width": 512,
+  "height": 256,
+  "decodedFormat": "NV12",
+  "rgbChannelsCompared": 393216,
+  "reference": "Canvas2D sRGB, same frozen decoded VideoFrame",
+  "ffmpegDecodedErrors": {
+    "bt709": {
+      "maxCodeError": 0,
+      "changedBytes": 0
+    },
+    "srgb": {
+      "maxCodeError": 0,
+      "changedBytes": 0
+    }
+  },
+  "encodedMetadata": {
+    "bt709": {
+      "profile": "High",
+      "pix_fmt": "yuv420p",
+      "color_range": "tv",
+      "color_space": "bt709",
+      "color_transfer": "bt709",
+      "color_primaries": "bt709"
+    },
+    "srgb": {
+      "profile": "High",
+      "pix_fmt": "yuv420p",
+      "color_range": "tv",
+      "color_space": "bt709",
+      "color_transfer": "iec61966-2-1",
+      "color_primaries": "bt709"
+    }
+  },
+  "fixtureHashes": {
+    "bt709-00.ts": "c707d7f6f43d9937e9c1e20028f884c913165bc2d386bf48b3c624f846642447",
+    "bt709.mp4": "ce37f87531471344edd999b0ef4a6a8e4c430d36841228c4d76f7af7dbc7ae91",
+    "source.yuv": "c58017ffe756d41366ab4d53bacd69da7b39e8c3b68e253f493e3a3904367bbf",
+    "srgb-00.ts": "6ccf70e0e78c661248219695d3c6037fdabca2e5374a717de59edb17ecb945f8",
+    "srgb.mp4": "2b07366a0afe48579fd46352c0cde2fc9cd56362776648c0b10488cdd6ed6921"
+  },
+  "browserDecodedPlanes": {
+    "bt709": {
+      "comparedBytes": 196608,
+      "changedBytes": 0,
+      "maxCodeError": 0
+    },
+    "srgb": {
+      "comparedBytes": 196608,
+      "changedBytes": 0,
+      "maxCodeError": 0
+    }
+  },
+  "bt709": {
+    "time": 0.502709,
+    "original": {
+      "mismatches": 367501,
+      "maxRoundedError": 57,
+      "mae": 8.7291
+    },
+    "transferOnly": {
+      "mismatches": 55028,
+      "maxRoundedError": 50,
+      "mae": 2.7641
+    },
+    "linearOnly": {
+      "mismatches": 367392,
+      "maxRoundedError": 12,
+      "mae": 7.4154
+    },
+    "combinedWgsl": {
+      "mismatches": 0,
+      "maxRoundedError": 0,
+      "mae": 0.2514,
+      "maxUnroundedError": 0.499395
+    }
+  },
+  "srgb": {
+    "time": 0.531802,
+    "original": {
+      "mismatches": 55028,
+      "maxRoundedError": 50,
+      "mae": 2.7641
+    },
+    "linearOnly": {
+      "mismatches": 0,
+      "maxRoundedError": 0,
+      "mae": 0.2514,
+      "maxUnroundedError": 0.499393
+    },
+    "combinedWgsl": {
+      "mismatches": 354148,
+      "maxRoundedError": 12,
+      "mae": 7.3076
+    }
+  },
+  "panelRgbChannelsCompared": 86016,
+  "bt709Panels": {
+    "neutralRamp": {
+      "transferOnlyMismatches": 0,
+      "combinedWgslMismatches": 0
+    },
+    "shadowSteps": {
+      "transferOnlyMismatches": 0,
+      "combinedWgslMismatches": 0
+    },
+    "verticalCbEdges": {
+      "transferOnlyMismatches": 19040,
+      "transferOnlyMaxRoundedError": 34,
+      "combinedWgslMismatches": 0
+    },
+    "horizontalCrEdges": {
+      "transferOnlyMismatches": 26884,
+      "transferOnlyMaxRoundedError": 50,
+      "combinedWgslMismatches": 0
+    }
+  },
+  "srgbPanels": {
+    "neutralRamp": {
+      "originalMismatches": 0,
+      "linearOnlyMismatches": 0
+    },
+    "shadowSteps": {
+      "originalMismatches": 0,
+      "linearOnlyMismatches": 0
+    },
+    "verticalCbEdges": {
+      "originalMismatches": 19040,
+      "originalMaxRoundedError": 34,
+      "linearOnlyMismatches": 0
+    },
+    "horizontalCrEdges": {
+      "originalMismatches": 26884,
+      "originalMaxRoundedError": 50,
+      "linearOnlyMismatches": 0
+    }
+  }
+}

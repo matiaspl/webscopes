@@ -1,4 +1,5 @@
-import { getColorMatrix, getSourceSize, normalizeAnalysisOptions } from "./analyze.js";
+import { captureFrameToCanvas, getColorMatrix, getSourceSize, normalizeAnalysisOptions } from "./analyze.js";
+import { createVideoColorQualifier, VIDEO_TRANSFER_SHADER } from "./video-color.js";
 import { createWebGpuScopeRenderer } from "./webgpu-render.js";
 
 const COMPUTE_SHADER = /* wgsl */ `
@@ -6,7 +7,7 @@ struct Params {
   dims: vec4<u32>,       // input width, input height, waveform width, waveform height
   crop: vec4<u32>,       // mode, crop x, crop y, crop width
   extra: vec4<u32>,      // crop height, vectorscope size, sampled width, sampled height
-  coeff: vec4<u32>,      // fixed-point Kr, Kb, fixed-point scale, unused
+  coeff: vec4<u32>,      // fixed-point Kr, Kb, fixed-point scale, inverse Apple transfer
 };
 
 @group(0) @binding(0) var inputTexture: texture_2d<f32>;
@@ -105,10 +106,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 `;
 
 const EXTERNAL_COMPUTE_SHADER = COMPUTE_SHADER
-  .replace("var inputTexture: texture_2d<f32>;", "var inputTexture: texture_external;")
+  .replace("var inputTexture: texture_2d<f32>;", `var inputTexture: texture_external;
+@group(0) @binding(3) var videoSampler: sampler;
+${VIDEO_TRANSFER_SHADER}`)
   .replace(
-    "textureLoad(inputTexture, vec2<i32>(i32(sourceX), i32(sourceY)), 0)",
-    "textureLoad(inputTexture, vec2<i32>(i32(sourceX), i32(sourceY)))",
+    "let rgb = textureLoad(inputTexture, vec2<i32>(i32(sourceX), i32(sourceY)), 0).rgb;",
+    `let uv = (vec2f(f32(sourceX), f32(sourceY)) + 0.5) / vec2f(params.dims.xy);
+  var rgb = textureSampleBaseClampToEdge(inputTexture, videoSampler, uv).rgb;
+  if (params.coeff.w == 1u) { rgb = undoAppleTransfer(rgb); }
+  rgb = clamp(rgb, vec3f(0.0), vec3f(1.0));`,
   );
 
 function gpuMode(mode) {
@@ -121,6 +127,7 @@ function gpuMode(mode) {
 export async function createWebGpuAnalyzer(options = {}) {
   let device = options.device;
   const useExternalVideoTextures = options.useExternalVideoTextures ?? true;
+  const videoCapture = {};
   let ownsDevice = false;
   let texture;
   let textureView;
@@ -135,6 +142,8 @@ export async function createWebGpuAnalyzer(options = {}) {
   let resourcesReleased = false;
   let inFlight = Promise.resolve();
   let lossState;
+  let videoQualifier;
+  let videoSampler;
 
   async function withValidationScope(operation) {
     let scopeOpen = false;
@@ -163,6 +172,8 @@ export async function createWebGpuAnalyzer(options = {}) {
   function releaseResources() {
     if (resourcesReleased) return;
     resourcesReleased = true;
+    videoQualifier?.destroy();
+    if (videoCapture.canvas) videoCapture.canvas.width = videoCapture.canvas.height = 1;
     for (const resource of [texture, binsBuffer, stagingBuffer, paramsBuffer]) {
       try { resource?.destroy(); } catch {}
     }
@@ -269,6 +280,7 @@ export async function createWebGpuAnalyzer(options = {}) {
       ownsDevice = true;
     }
 
+    videoQualifier = createVideoColorQualifier(device);
     const lostPromise = device.lost && typeof device.lost.then === "function"
       ? device.lost.then((info) => { lossState = { info }; return lossState; }, (error) => { lossState = { error }; return lossState; })
       : new Promise(() => {});
@@ -315,6 +327,13 @@ export async function createWebGpuAnalyzer(options = {}) {
       const task = inFlight.then(async () => {
         if (destroyed) throw new Error("WebGPU analyzer has been destroyed");
         throwIfDeviceLost();
+        const videoInput = isVideoSource(source);
+        const transfer = externalVideo ? await videoQualifier.qualify(source) : null;
+        externalVideo = transfer !== null;
+        throwIfDeviceLost();
+        if (videoInput && !externalVideo) {
+          source = captureFrameToCanvas(source, videoCapture, { willReadFrequently: false, colorSpace: "srgb" }).canvas;
+        }
         const { width, height } = getSourceSize(source);
         const config = normalizeAnalysisOptions(width, height, analysisOptions);
         const {
@@ -332,12 +351,14 @@ export async function createWebGpuAnalyzer(options = {}) {
             throw new Error("This WebGPU device does not support external video textures");
           }
           if (limit(device.limits, "maxSampledTexturesPerShaderStage") < 4
-            || limit(device.limits, "maxSamplersPerShaderStage") < 1
-            || limit(device.limits, "maxUniformBuffersPerShaderStage") < 2) {
+            || limit(device.limits, "maxSamplersPerShaderStage") < 2
+            || limit(device.limits, "maxUniformBuffersPerShaderStage") < 2
+            || limit(device.limits, "maxBindingsPerBindGroup") < 4) {
             throw new RangeError("GPU device limits do not support external video textures in the histogram shader");
           }
         }
         const activePipeline = externalVideo ? await ensureExternalPipeline() : pipeline;
+        if (externalVideo) videoSampler ??= device.createSampler({ minFilter: "linear", magFilter: "linear" });
 
         const matrix = getColorMatrix(colorMatrix);
         const words = [width, height, waveformWidth, waveformHeight, gpuMode(waveformMode), x0, y0, cropWidth, cropHeight, vectorscopeSize, sampleWidth, sampleHeight];
@@ -345,6 +366,7 @@ export async function createWebGpuAnalyzer(options = {}) {
         parameterView.setUint32(48, matrix.krFixed, true);
         parameterView.setUint32(52, matrix.kbFixed, true);
         parameterView.setUint32(56, 1024, true);
+        parameterView.setUint32(60, transfer ?? 0, true);
 
         await withValidationScope(() => {
           let activeBindGroup;
@@ -358,6 +380,7 @@ export async function createWebGpuAnalyzer(options = {}) {
                 { binding: 0, resource: externalTexture },
                 { binding: 1, resource: { buffer: binsBuffer } },
                 { binding: 2, resource: { buffer: paramsBuffer } },
+                { binding: 3, resource: videoSampler },
               ],
             });
           } else {
@@ -439,7 +462,7 @@ export async function createWebGpuAnalyzer(options = {}) {
           sampleCount: sampleWidth * sampleHeight,
           waveform: { width: waveformWidth, height: waveformHeight, bitDepth, mode: waveformMode, channelNames, channels },
           vectorscope: { width: vectorscopeSize, height: vectorscopeSize, bins: allBins.subarray(0, vectorArea), colorMatrix },
-          stats: { colorMatrix, bitDepth },
+          stats: { colorMatrix, bitDepth, ...(videoInput ? { videoColorMode: externalVideo ? (transfer === 1 ? "external-apple" : "external-identity") : "canvas" } : {}) },
         };
       });
       // Do not keep the previous result alive through the serialization gate;
@@ -483,11 +506,6 @@ function isVideoSource(source) {
     || (Number.isFinite(source?.videoWidth) && Number.isFinite(source?.videoHeight));
 }
 
-function isSafariDisplay() {
-  const userAgent = globalThis.navigator?.userAgent ?? "";
-  return /Safari\//.test(userAgent) && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Opera|FxiOS|Firefox)/i.test(userAgent);
-}
-
 /** Create an opt-in WebGPU display which keeps histograms on the GPU between snapshots. */
 export async function createScopeDisplay(options = {}) {
   const canvas = options.canvas;
@@ -508,6 +526,8 @@ export async function createScopeDisplay(options = {}) {
   let lossState;
   let lostPromise;
   let externalPipeline;
+  let videoQualifier;
+  let videoSampler;
   let pendingRequest;
   let pumpRunning = false;
   let frameId = 0;
@@ -520,8 +540,8 @@ export async function createScopeDisplay(options = {}) {
   const completionTasks = new Set();
   const snapshotTasks = new Set();
   const commandTasks = new Set();
-  const useExternalVideoTextures = options.videoTextureMode === "external"
-    || (options.videoTextureMode !== "copy" && !isSafariDisplay());
+  const useExternalVideoTextures = options.videoTextureMode === "external";
+  const videoCapture = {};
 
   function makeSlot() {
     return {
@@ -582,6 +602,13 @@ export async function createScopeDisplay(options = {}) {
   function releaseResources() {
     if (resourcesReleased) return;
     resourcesReleased = true;
+    videoQualifier?.destroy();
+    if (videoCapture.canvas) {
+      videoCapture.canvas.width = 1;
+      videoCapture.canvas.height = 1;
+      videoCapture.canvas = undefined;
+      videoCapture.context = undefined;
+    }
     try { renderer?.destroy(); } catch {}
     for (const slot of slots) {
       for (const resource of [slot.texture, slot.binsBuffer, slot.computeParamsBuffer, slot.renderParamsBuffer]) {
@@ -628,9 +655,9 @@ export async function createScopeDisplay(options = {}) {
       throw new RangeError("GPU device cannot allocate the display parameter buffers");
     }
     if (max("maxBindingsPerBindGroup") < 4 || max("maxStorageBuffersPerShaderStage") < 1
-      || max("maxUniformBuffersPerShaderStage") < 1
+      || max("maxUniformBuffersPerShaderStage") < (externalVideo ? 2 : 1)
       || max("maxSampledTexturesPerShaderStage") < (externalVideo ? 4 : 2)
-      || (externalVideo && max("maxSamplersPerShaderStage") < 1)) {
+      || (externalVideo && max("maxSamplersPerShaderStage") < 2)) {
       throw new RangeError("GPU device limits do not support external video textures in the histogram shader");
     }
   }
@@ -750,12 +777,18 @@ export async function createScopeDisplay(options = {}) {
 
   async function submitRequest(slot, request) {
     throwIfUnavailable();
-    const { source, analysisOptions, resolve, reject } = request;
+    const { analysisOptions, resolve, reject } = request;
+    let source = request.source;
+    let ownedFrame;
     const startedAt = displayNow();
     let queueSubmitted = false;
     try {
       if (source && typeof source === "object" && "data" in source) {
         throw new TypeError("ScopeDisplay accepts decoded browser image/video sources; use createScopes for raw pixel frames");
+      }
+      if (useExternalVideoTextures && isVideoSource(source) && typeof globalThis.VideoFrame === "function"
+        && !(source instanceof globalThis.VideoFrame)) {
+        try { source = ownedFrame = new globalThis.VideoFrame(source); } catch {}
       }
       const { width, height } = getSourceSize(source);
       const merged = { ...options, ...analysisOptions };
@@ -765,7 +798,10 @@ export async function createScopeDisplay(options = {}) {
       const channelArea = config.waveformWidth * config.waveformHeight;
       const binCount = vectorArea + channelArea * channelCount;
       const byteLength = binCount * Uint32Array.BYTES_PER_ELEMENT;
-      const externalVideo = useExternalVideoTextures && isVideoSource(source);
+      const transfer = useExternalVideoTextures && isVideoSource(source) ? await videoQualifier.qualify(source) : null;
+      const externalVideo = transfer !== null;
+      throwIfUnavailable();
+      if (externalVideo) videoSampler ??= device.createSampler({ minFilter: "linear", magFilter: "linear" });
       const renderOptions = { ...options.renderOptions, ...analysisOptions.renderOptions };
       validLimits(width, height, config, byteLength, externalVideo, renderOptions);
       if (externalVideo && typeof device.importExternalTexture !== "function") {
@@ -783,14 +819,20 @@ export async function createScopeDisplay(options = {}) {
       computeView.setUint32(48, matrix.krFixed, true);
       computeView.setUint32(52, matrix.kbFixed, true);
       computeView.setUint32(56, 1024, true);
+      computeView.setUint32(60, transfer ?? 0, true);
       const activePipeline = externalVideo ? await getExternalPipeline() : pipeline;
       await withValidationScope(() => {
         let sourceResource;
         if (externalVideo) {
           sourceResource = device.importExternalTexture({ source, colorSpace: "srgb" });
         } else {
+          // Match createScopes: direct video uploads can take the same browser
+          // conversion path as external textures, so normalize via sRGB first.
+          const uploadSource = isVideoSource(source)
+            ? captureFrameToCanvas(source, videoCapture, { willReadFrequently: false, colorSpace: "srgb" }).canvas
+            : source;
           device.queue.copyExternalImageToTexture(
-            { source },
+            { source: uploadSource },
             { texture: slot.texture, colorSpace: "srgb", premultipliedAlpha: false },
             { width, height },
           );
@@ -803,6 +845,7 @@ export async function createScopeDisplay(options = {}) {
             { binding: 0, resource: sourceResource },
             { binding: 1, resource: { buffer: slot.binsBuffer } },
             { binding: 2, resource: { buffer: slot.computeParamsBuffer } },
+            ...(externalVideo ? [{ binding: 3, resource: videoSampler }] : []),
           ],
         });
         const resultMetadata = buildFrameMetadata(width, height, config, frameId + 1);
@@ -820,6 +863,7 @@ export async function createScopeDisplay(options = {}) {
       throwIfUnavailable();
       const id = ++frameId;
       const metadata = buildFrameMetadata(width, height, config, id);
+      if (isVideoSource(source)) metadata.stats.videoColorMode = externalVideo ? (transfer === 1 ? "external-apple" : "external-identity") : "canvas";
       slot.frame = { metadata, vectorArea, channelArea, channelCount, byteLength, frameId: id };
       slot.outstanding = true;
       slot.busy = false;
@@ -842,6 +886,8 @@ export async function createScopeDisplay(options = {}) {
       // drained even when the request itself rejects.
       if (queueSubmitted) trackQueueCompletion(slot, undefined);
       reject(error);
+    } finally {
+      ownedFrame?.close();
     }
   }
 
@@ -882,6 +928,7 @@ export async function createScopeDisplay(options = {}) {
       device = await adapter.requestDevice();
       ownsDevice = true;
     }
+    videoQualifier = createVideoColorQualifier(device);
     lostPromise = device.lost && typeof device.lost.then === "function"
       ? device.lost.then((info) => { emitDeviceLoss({ info }); return { info }; }, (error) => { emitDeviceLoss({ error }); return { error }; })
       : new Promise(() => {});

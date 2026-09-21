@@ -16,11 +16,6 @@ function elapsedSince(startedAt) {
   return Math.max(0, monotonicNow() - startedAt);
 }
 
-function isSafariUserAgent(userAgent = globalThis.navigator?.userAgent ?? "") {
-  return /Safari\//.test(userAgent)
-    && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Opera|FxiOS|Firefox)/i.test(userAgent);
-}
-
 export {
   analyzeFrame,
   generateTestSignalSlate,
@@ -45,8 +40,9 @@ export async function createScopes(options = {}) {
   let backend = "cpu";
   if (requestedBackend !== "cpu") {
     try {
-      const useExternalVideoTextures = videoTextureMode === "external"
-        || (videoTextureMode === "auto" && !isSafariUserAgent());
+      // Browser external-video imports can apply a different color conversion
+      // from CPU readback. Normalize through an sRGB canvas unless opted in.
+      const useExternalVideoTextures = videoTextureMode === "external";
       gpuAnalyzer = await createWebGpuAnalyzer({ ...options, useExternalVideoTextures });
       backend = "webgpu";
     } catch (error) {
@@ -208,6 +204,7 @@ export async function createScopes(options = {}) {
         ...nextResult,
         stats: {
           ...nextResult.stats,
+          ...(isVideoInput && frameBackend === "webgpu" ? { videoColorMode: nextResult.stats.videoColorMode ?? "canvas" } : {}),
           performance: {
             backend: frameBackend,
             frameTimeMs,

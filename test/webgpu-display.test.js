@@ -71,6 +71,7 @@ function mockDevice(options = {}) {
     shaders: [],
     submittedWork: [],
     validationPops: 0,
+    uploads: [],
   };
   const limits = {
     maxTextureDimension2D: 8192,
@@ -81,7 +82,7 @@ function mockDevice(options = {}) {
     maxSamplersPerShaderStage: 8,
   };
   const queue = {
-    copyExternalImageToTexture() {},
+    copyExternalImageToTexture(source) { state.uploads.push(source); },
     writeTexture() {},
     writeBuffer(buffer, offset, bytes) {
       if (buffer?.memory && bytes?.byteLength) new Uint8Array(buffer.memory, offset, bytes.byteLength).set(new Uint8Array(bytes.buffer ?? bytes, bytes.byteOffset ?? 0, bytes.byteLength));
@@ -156,6 +157,42 @@ function mockDevice(options = {}) {
 function fixture() {
   return { width: 4, height: 3, nodeName: "IMG" };
 }
+
+test("ScopeDisplay normalizes default video uploads through a reusable sRGB canvas", async () => {
+  const restore = installGpuConstants();
+  const previousCanvas = globalThis.OffscreenCanvas;
+  const captures = [];
+  globalThis.OffscreenCanvas = class {
+    constructor(width, height) { this.width = width; this.height = height; }
+    getContext(kind, options) {
+      assert.equal(kind, "2d");
+      assert.equal(options.colorSpace, "srgb");
+      const context = mock2dCanvas(this.width, this.height).getContext("2d");
+      context.drawImage = (source) => captures.push(source);
+      return context;
+    }
+  };
+  let display;
+  try {
+    const device = mockDevice();
+    display = await createScopeDisplay({ canvas: makeCanvas().canvas, device });
+    const video = { videoWidth: 4, videoHeight: 2, nodeName: "VIDEO" };
+    for (let i = 0; i < 2; i += 1) {
+      await display.present(video, { waveformWidth: 16, waveformHeight: 16, vectorscopeSize: 64 });
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.deepEqual(captures, [video, video]);
+    const videoUploads = device.state.uploads.filter(({ source }) => source.width === 4);
+    assert.equal(videoUploads.length, 2);
+    assert.ok(videoUploads[0].source instanceof globalThis.OffscreenCanvas);
+    assert.strictEqual(videoUploads[0].source, videoUploads[1].source);
+  } finally {
+    await display?.destroy();
+    if (previousCanvas === undefined) delete globalThis.OffscreenCanvas;
+    else globalThis.OffscreenCanvas = previousCanvas;
+    restore();
+  }
+});
 
 test("ScopeDisplay requires a canvas with a fresh WebGPU context", async () => {
   const restore = installGpuConstants();
