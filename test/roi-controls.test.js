@@ -78,6 +78,61 @@ test("frame pacer skips duplicate frame tokens but allows ROI and analyzer chang
   assert.equal(pacer.shouldAnalyze(1.3, 1, scopesB), true);
 });
 
+test("frame pacer rate limits before accepting a token and forced refreshes bypass one deadline", () => {
+  let now = 0;
+  const pacer = createFramePacer({ maxRefreshRate: 20, now: () => now });
+  const scopes = {};
+  assert.equal(pacer.shouldAnalyze(1, 0, scopes), true);
+  now = 25;
+  assert.equal(pacer.shouldAnalyze(2, 0, scopes), false);
+  now = 50;
+  assert.equal(pacer.shouldAnalyze(2, 0, scopes), true, "a throttled frame token was not recorded as analyzed");
+  now = 60;
+  assert.equal(pacer.shouldAnalyze(3, 0, scopes), false);
+  assert.equal(pacer.shouldAnalyze(3, 1, scopes, { force: true }), true);
+  now = 85;
+  assert.equal(pacer.shouldAnalyze(4, 1, scopes), false, "the forced update starts the next normal deadline");
+  now = 110;
+  assert.equal(pacer.shouldAnalyze(4, 1, scopes), true);
+});
+
+test("frame pacer measures the next deadline from update completion", () => {
+  let now = 0;
+  const pacer = createFramePacer({ maxRefreshRate: 20, now: () => now });
+  const scopes = {};
+  assert.equal(pacer.shouldAnalyze(1, 0, scopes), true);
+  now = 80;
+  pacer.complete();
+  now = 100;
+  assert.equal(pacer.shouldAnalyze(2, 0, scopes), false);
+  now = 130;
+  assert.equal(pacer.shouldAnalyze(2, 0, scopes), true);
+  now = 170;
+  pacer.complete();
+  now = 190;
+  assert.equal(pacer.shouldAnalyze(3, 0, scopes), false);
+  now = 220;
+  assert.equal(pacer.shouldAnalyze(3, 0, scopes), true);
+});
+
+test("a twenty update per second cap bounds thirty and sixty frame per second input", () => {
+  for (const sourceRate of [30, 60]) {
+    let now = 0;
+    const pacer = createFramePacer({ maxRefreshRate: 20, now: () => now });
+    const scopes = {};
+    let accepted = 0;
+    for (let frame = 0; frame < sourceRate; frame += 1) {
+      now = frame * 1_000 / sourceRate;
+      if (pacer.shouldAnalyze(frame, 0, scopes)) {
+        accepted += 1;
+        now += 3;
+        pacer.complete();
+      }
+    }
+    assert.ok(accepted <= 20, `accepted ${accepted} updates from ${sourceRate} presented frames`);
+  }
+});
+
 test("a tap leaves the ROI unchanged and does not schedule analysis", () => {
   const original = { x: 0.2, y: 0.1, width: 0.5, height: 0.6 };
   const harness = selectionHarness(original);
@@ -192,4 +247,54 @@ test("pending refresh resumes when a frame becomes available and destroy cancels
   assert.equal(frames.callbacks.size, 1);
   scheduler.destroy();
   assert.equal(frames.callbacks.size, 0);
+});
+
+test("refresh scheduler suspends queued work and coalesces changes until visible", async () => {
+  const frames = fakeAnimationFrames();
+  const updates = [];
+  const scheduler = createRoiRefreshScheduler({
+    requestFrame: frames.request,
+    cancelFrame: frames.cancel,
+    run({ revision, force }) {
+      updates.push({ revision, force });
+      return { promise: Promise.resolve(), regionRevision: revision };
+    },
+  });
+  scheduler.suspend();
+  scheduler.schedule();
+  scheduler.schedule();
+  assert.equal(frames.callbacks.size, 0);
+  scheduler.resume();
+  assert.equal(frames.callbacks.size, 1);
+  frames.flush();
+  await Promise.resolve();
+  assert.deepEqual(updates, [{ revision: 2, force: true }]);
+  scheduler.destroy();
+});
+
+test("refresh scheduler cancels a queued callback with the window that created it", () => {
+  const firstWindow = fakeAnimationFrames();
+  const secondWindow = fakeAnimationFrames();
+  const owners = [];
+  let owner = firstWindow;
+  const scheduler = createRoiRefreshScheduler({
+    requestFrame(callback) {
+      const callbackOwner = owner;
+      const id = callbackOwner.request(callback);
+      return { callbackOwner, id };
+    },
+    cancelFrame(handle) { handle.callbackOwner.cancel(handle.id); },
+    run() {
+      owners.push(owner);
+      return { promise: Promise.resolve(), regionRevision: scheduler.revision };
+    },
+  });
+  scheduler.schedule();
+  owner = secondWindow;
+  scheduler.rebind();
+  assert.equal(firstWindow.callbacks.size, 0);
+  assert.equal(secondWindow.callbacks.size, 1);
+  secondWindow.flush();
+  assert.deepEqual(owners, [secondWindow]);
+  scheduler.destroy();
 });

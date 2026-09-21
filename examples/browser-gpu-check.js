@@ -1,4 +1,6 @@
-import { analyzeFrame, createScopes, renderScopes } from "../src/index.js";
+import { analyzeFrame, createScopeDisplay, createScopes, renderScopes } from "../src/index.js";
+import { analyzeCapturedPixels, readFramePixelsAsync } from "../src/analyze.js";
+import { getScopeRenderGeometry } from "../src/render.js";
 import { runRoiBrowserChecks } from "./roi-browser-check.js";
 
 const status = document.querySelector("#status");
@@ -99,6 +101,64 @@ async function benchmark(callback, warmups = 4, samples = 20) {
   return { ...summarizeTimes(timings), samples, histogramBytes: histogramBytes(result), result };
 }
 
+async function measureMainThreadTimerDrift(callback) {
+  let intervalSamples = 0;
+  let maxTimerDriftMs = 0;
+  let expectedAt = performance.now() + 16;
+  const timer = setInterval(() => {
+    const now = performance.now();
+    intervalSamples += 1;
+    maxTimerDriftMs = Math.max(maxTimerDriftMs, Math.max(0, now - expectedAt));
+    expectedAt = now + 16;
+  }, 16);
+  const startedAt = performance.now();
+  try {
+    await callback();
+  } finally {
+    clearInterval(timer);
+  }
+  return { intervalSamples, maxTimerDriftMs, measuredUpdateMs: performance.now() - startedAt };
+}
+
+async function checkBrowserRoiCapture(fixture) {
+  if (typeof VideoFrame !== "function") return { available: false, passed: true, detail: "VideoFrame unavailable" };
+  let frame;
+  try { frame = new VideoFrame(fixture.canvas, { timestamp: 0 }); } catch (error) {
+    return { available: false, passed: true, detail: `VideoFrame construction unavailable: ${error.message}` };
+  }
+  const options = {
+    waveformMode: "composite",
+    colorMatrix: "bt2020",
+    inputResolutionScaling: 0.5,
+    region: { x: 243 / fixture.canvas.width, y: 137 / fixture.canvas.height, width: 720 / fixture.canvas.width, height: 540 / fixture.canvas.height },
+    waveformWidth: 240,
+    waveformHeight: 256,
+    vectorscopeSize: 128,
+  };
+  try {
+    const captureStartedAt = performance.now();
+    const captured = await readFramePixelsAsync(frame, {}, options);
+    const captureTimeMs = performance.now() - captureStartedAt;
+    const analysisStartedAt = performance.now();
+    const croppedResult = analyzeCapturedPixels(captured, options);
+    const analysisTimeMs = performance.now() - analysisStartedAt;
+    const referenceResult = analyzeFrame(fixture.imageData, options);
+    const comparison = compareBins(referenceResult, croppedResult);
+    return {
+      available: true,
+      passed: croppedResult.sampleCount === referenceResult.sampleCount && comparison.totalAbsoluteDifference === 0,
+      captureUsedRoi: captured.captureUsedRoi,
+      captureBytes: captured.capturedByteLength ?? captured.data.byteLength,
+      fullFrameBytes: fixture.canvas.width * fixture.canvas.height * 4,
+      captureTimeMs,
+      analysisTimeMs,
+      totalAbsoluteDifference: comparison.totalAbsoluteDifference,
+    };
+  } finally {
+    frame.close();
+  }
+}
+
 function checkHighBitDepth(bitDepth) {
   const codeMax = 2 ** bitDepth - 1;
   const result = analyzeFrame({
@@ -195,17 +255,34 @@ async function runBrowserPerformance(cpuScopes, gpuScopes) {
       gpuScopes.render();
       return result;
     });
+    const cpuStages = cpuAnalysis.result.stats.performance;
+    const mainThreadResponsiveness = await measureMainThreadTimerDrift(() => cpuScopes.update(fixture.canvas, options));
+    const browserRoiCapture = await checkBrowserRoiCapture(fixture);
     return {
       input: [fixture.canvas.width, fixture.canvas.height],
       output: [cpuCanvas.width, cpuCanvas.height],
       warmups: 4,
       timedSamples: 20,
-      cpu: { analysis: { medianMs: cpuAnalysis.medianMs, p95Ms: cpuAnalysis.p95Ms }, render: { medianMs: cpuRender.medianMs, p95Ms: cpuRender.p95Ms }, total: { medianMs: cpuTotal.medianMs, p95Ms: cpuTotal.p95Ms } },
+      cpu: {
+        analysis: { medianMs: cpuAnalysis.medianMs, p95Ms: cpuAnalysis.p95Ms },
+        render: { medianMs: cpuRender.medianMs, p95Ms: cpuRender.p95Ms },
+        total: { medianMs: cpuTotal.medianMs, p95Ms: cpuTotal.p95Ms },
+        captureStages: {
+          captureTimeMs: cpuStages.captureTimeMs,
+          analysisTimeMs: cpuStages.analysisTimeMs,
+          updateTimeMs: cpuStages.updateTimeMs,
+          captureBytes: cpuStages.captureBytes,
+          captureUsedRoi: cpuStages.captureUsedRoi,
+          workerAndVideoFrameAvailable: typeof Worker === "function" && typeof VideoFrame === "function",
+        },
+        mainThreadResponsiveness,
+      },
       webgpu: { analysis: { medianMs: gpuAnalysis.medianMs, p95Ms: gpuAnalysis.p95Ms }, render: { medianMs: gpuRender.medianMs, p95Ms: gpuRender.p95Ms }, total: { medianMs: gpuTotal.medianMs, p95Ms: gpuTotal.p95Ms } },
       cpuHistogramBytes: cpuAnalysis.histogramBytes,
       gpuHistogramBytes: gpuAnalysis.histogramBytes,
       cpuCaptureCanvasCreations: captureCanvasCreations,
       cpuCaptureCanvasCounterAvailable: captureCanvasCounterAvailable,
+      browserRoiCapture,
       notes: ["current implementation only", "browser wall time includes WebGPU readback", "histogramBytes is retained result storage"],
     };
   } finally {
@@ -215,13 +292,16 @@ async function runBrowserPerformance(cpuScopes, gpuScopes) {
 
 let cpuScopes;
 let gpuScopes;
+let directDisplay;
+let sharedGpuDevice;
 try {
   status.textContent = `Browser: ${navigator.userAgent}\nSecure context: ${isSecureContext}\nWebGPU exposed: ${Boolean(navigator.gpu)}\nRunning CPU/WebGPU parity matrix…`;
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new Error("No WebGPU adapter is available");
   const adapterInfo = adapter.info;
+  sharedGpuDevice = await adapter.requestDevice();
   cpuScopes = await createScopes({ backend: "cpu", autoRender: false });
-  gpuScopes = await createScopes({ backend: "webgpu", adapter, autoRender: false });
+  gpuScopes = await createScopes({ backend: "webgpu", device: sharedGpuDevice, autoRender: false });
 
   const cases = [];
   const failures = [];
@@ -269,6 +349,137 @@ try {
     }
   }
 
+  const directCanvas = document.querySelector("#direct");
+  directCanvas.width = 640;
+  directCanvas.height = 360;
+  directDisplay = await createScopeDisplay({
+    canvas: directCanvas,
+    gpu: navigator.gpu,
+    renderOptions: { ...DEMO_RENDER_OPTIONS, devicePixelRatio: 1, showPerformance: false },
+  });
+  const directCases = [];
+  for (const fixture of fixtures) {
+    for (const waveformMode of modes) {
+      for (const colorMatrix of matrices) {
+        const options = {
+          waveformMode,
+          colorMatrix,
+          waveformWidth: 31,
+          waveformHeight: 64,
+          vectorscopeSize: 64,
+          ...fixture.options,
+        };
+        const cpu = await cpuScopes.update(fixture.imageData, options);
+        const submitted = await directDisplay.present(fixture.canvas, options);
+        const snapshot = await directDisplay.snapshot();
+        const comparison = compareBins(cpu, snapshot);
+        const passed = submitted.status === "submitted"
+          && snapshot.sampleCount === cpu.sampleCount
+          && comparison.totalAbsoluteDifference === 0;
+        const entry = { fixture: fixture.name, waveformMode, colorMatrix, passed, ...comparison };
+        directCases.push(entry);
+        if (!passed) failures.push({ ...entry, directDisplay: true });
+      }
+    }
+  }
+
+  let directVideoFrameCheck = { available: false, passed: true, route: "VideoFrame unavailable" };
+  if (typeof VideoFrame === "function") {
+    let testFrame;
+    try { testFrame = new VideoFrame(fixtures[0].canvas, { timestamp: 0 }); } catch {}
+    if (testFrame) {
+      const videoOptions = {
+        waveformMode: "ycbcr-parade",
+        colorMatrix: "bt2020",
+        waveformWidth: 31,
+        waveformHeight: 64,
+        vectorscopeSize: 64,
+        inputResolutionScaling: 0.5,
+      };
+      try {
+        const cpu = await cpuScopes.update(fixtures[0].imageData, videoOptions);
+        const submitted = await directDisplay.present(testFrame, videoOptions);
+        const snapshot = await directDisplay.snapshot();
+        const comparison = compareBins(cpu, snapshot);
+        directVideoFrameCheck = {
+          available: true,
+          passed: submitted.status === "submitted" && snapshot.sampleCount === cpu.sampleCount && comparison.totalAbsoluteDifference === 0,
+          route: "decoded VideoFrame",
+          mismatchedBins: comparison.mismatchedBins,
+          totalAbsoluteDifference: comparison.totalAbsoluteDifference,
+        };
+        if (!directVideoFrameCheck.passed) failures.push({ ...directVideoFrameCheck, directVideoFrame: true });
+      } catch (error) {
+        directVideoFrameCheck = { available: true, passed: false, route: "decoded VideoFrame", error: error?.message ?? String(error) };
+        failures.push({ ...directVideoFrameCheck, directVideoFrame: true });
+      } finally {
+        testFrame.close();
+      }
+    }
+  }
+
+  const directRenderOptions = {
+    waveformMode: "rgb-parade",
+    colorMatrix: "bt709",
+    waveformWidth: 640,
+    waveformHeight: 256,
+    vectorscopeSize: 128,
+  };
+  const directRenderFixture = fixtures[0];
+  const directCpuRenderResult = await cpuScopes.update(directRenderFixture.imageData, directRenderOptions);
+  const directSubmitted = await directDisplay.present(directRenderFixture.canvas, directRenderOptions);
+  for (let attempt = 0; attempt < 120 && directDisplay.queueCompletedFrames < directSubmitted.frameId; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 16));
+  }
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  let directRenderParity = { available: false, passed: false, maxChannelDifference: null };
+  if (typeof createImageBitmap === "function") {
+    const referenceCanvas = document.querySelector("#direct-reference");
+    referenceCanvas.width = directCanvas.width;
+    referenceCanvas.height = directCanvas.height;
+    renderScopes(directCpuRenderResult, referenceCanvas, { ...DEMO_RENDER_OPTIONS, devicePixelRatio: 1, showPerformance: false });
+    const referenceContext = referenceCanvas.getContext("2d", { willReadFrequently: true });
+    const reference = referenceContext.getImageData(0, 0, referenceCanvas.width, referenceCanvas.height).data;
+    const bitmap = await createImageBitmap(directCanvas);
+    referenceContext.drawImage(bitmap, 0, 0);
+    bitmap.close?.();
+    const displayed = referenceContext.getImageData(0, 0, referenceCanvas.width, referenceCanvas.height).data;
+    let maxChannelDifference = 0;
+    let channelValuesOverTolerance = 0;
+    let maxDifferenceAt;
+    const firstDifferences = [];
+    const geometry = getScopeRenderGeometry(referenceCanvas.width, referenceCanvas.height, { devicePixelRatio: 1 });
+    const mismatchRegions = { waveform: 0, vectorscope: 0, annotationsAndBackground: 0 };
+    for (let index = 0; index < reference.length; index += 1) {
+      const difference = Math.abs(reference[index] - displayed[index]);
+      if (difference > maxChannelDifference) {
+        maxChannelDifference = difference;
+        const pixel = Math.floor(index / 4);
+        maxDifferenceAt = {
+          x: pixel % referenceCanvas.width,
+          y: Math.floor(pixel / referenceCanvas.width),
+          channel: ["red", "green", "blue", "alpha"][index % 4],
+          reference: reference[index],
+          direct: displayed[index],
+        };
+      }
+      if (difference > 2) {
+        channelValuesOverTolerance += 1;
+        const pixel = Math.floor(index / 4);
+        const x = pixel % referenceCanvas.width;
+        const y = Math.floor(pixel / referenceCanvas.width);
+        const inside = (rect) => x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height;
+        if (inside(geometry.waveformRect)) mismatchRegions.waveform += 1;
+        else if (inside(geometry.vectorRect)) mismatchRegions.vectorscope += 1;
+        else mismatchRegions.annotationsAndBackground += 1;
+        if (firstDifferences.length < 8) {
+          firstDifferences.push({ x, y, channel: ["red", "green", "blue", "alpha"][index % 4], reference: reference[index], direct: displayed[index] });
+        }
+      }
+    }
+    directRenderParity = { available: true, passed: channelValuesOverTolerance === 0, maxChannelDifference, maxDifferenceAt, channelValuesOverTolerance, mismatchRegions, firstDifferences };
+  }
+
   const highBitChecks = [checkHighBitDepth(10), checkHighBitDepth(12)];
   const passed = failures.length === 0 && highBitChecks.every((check) => check.passed);
   const barsCpu = await cpuScopes.update(fixtures[0].imageData, { waveformMode: "rgb-parade", waveformWidth: 640, waveformHeight: 256, inputResolutionScaling: 0.5 });
@@ -282,8 +493,10 @@ try {
   const roiChecks = await runRoiBrowserChecks();
   const browserPerformance = await runBrowserPerformance(cpuScopes, gpuScopes);
 
-  const allPassed = passed && Object.values(renderChecks).every(Boolean) && roiChecks.passed;
-  window.webscopesParityResult = { passed: allPassed, caseCount: cases.length, failures, highBitChecks, renderChecks, roiChecks, browserPerformance };
+  const directHistogramParity = directCases.every((entry) => entry.passed);
+  const allPassed = passed && directHistogramParity && directVideoFrameCheck.passed && directRenderParity.passed
+    && Object.values(renderChecks).every(Boolean) && roiChecks.passed;
+  window.webscopesParityResult = { passed: allPassed, caseCount: cases.length, failures, highBitChecks, renderChecks, directCases, directHistogramParity, directVideoFrameCheck, directRenderParity, roiChecks, browserPerformance };
   status.textContent = [
     `PASS: ${allPassed}`,
     `Cases: ${cases.length}; failures: ${failures.length}`,
@@ -292,11 +505,18 @@ try {
     `Matrices: ${matrices.join(", ")}`,
     `High-bit-depth CPU: ${highBitChecks.map((check) => `${check.bitDepth}-bit ${check.passed ? "PASS" : "FAIL"}`).join(", ")}`,
     `Real-canvas target colors: CPU ${renderChecks.cpuTargetColor ? "PASS" : "FAIL"}; GPU ${renderChecks.gpuTargetColor ? "PASS" : "FAIL"}`,
+    `Direct ScopeDisplay histogram cases: ${directCases.length}; exact parity: ${directHistogramParity ? "PASS" : "FAIL"}`,
+    `Direct ScopeDisplay VideoFrame: ${directVideoFrameCheck.available ? directVideoFrameCheck.passed ? "PASS" : "FAIL" : "unavailable"}; ${directVideoFrameCheck.route}${directVideoFrameCheck.error ? ` · ${directVideoFrameCheck.error}` : ""}`,
+    `Direct WebGPU render: ${directRenderParity.passed ? "PASS" : directRenderParity.available ? "FAIL" : "unavailable"}; max per-channel difference ${directRenderParity.maxChannelDifference ?? "n/a"}; tolerance 2/255; max at ${JSON.stringify(directRenderParity.maxDifferenceAt ?? null)}; over-tolerance channel values by area ${JSON.stringify(directRenderParity.mismatchRegions ?? {})}`,
+    directRenderParity.firstDifferences?.length ? `Direct render first differences: ${JSON.stringify(directRenderParity.firstDifferences)}` : "",
     `Browser ROI interactions: ${roiChecks.passed ? "PASS" : "FAIL"} · ${Object.keys(roiChecks.checks).length} cases`,
     `Browser performance (20 samples, 4 warmups): CPU analysis ${browserPerformance.cpu.analysis.medianMs.toFixed(1)}/${browserPerformance.cpu.analysis.p95Ms.toFixed(1)} ms median/p95; WebGPU ${browserPerformance.webgpu.analysis.medianMs.toFixed(1)}/${browserPerformance.webgpu.analysis.p95Ms.toFixed(1)} ms`,
     `Render CPU ${browserPerformance.cpu.render.medianMs.toFixed(1)}/${browserPerformance.cpu.render.p95Ms.toFixed(1)} ms; GPU result ${browserPerformance.webgpu.render.medianMs.toFixed(1)}/${browserPerformance.webgpu.render.p95Ms.toFixed(1)} ms`,
     `Total update+render CPU ${browserPerformance.cpu.total.medianMs.toFixed(1)}/${browserPerformance.cpu.total.p95Ms.toFixed(1)} ms; GPU ${browserPerformance.webgpu.total.medianMs.toFixed(1)}/${browserPerformance.webgpu.total.p95Ms.toFixed(1)} ms`,
     `Histogram bytes CPU/GPU: ${browserPerformance.cpuHistogramBytes}/${browserPerformance.gpuHistogramBytes}; CPU capture canvases: ${browserPerformance.cpuCaptureCanvasCounterAvailable ? browserPerformance.cpuCaptureCanvasCreations : "counter unavailable"}`,
+    `CPU capture stages: ${JSON.stringify(browserPerformance.cpu.captureStages)}`,
+    `CPU main-thread timer drift during update: ${JSON.stringify(browserPerformance.cpu.mainThreadResponsiveness)}`,
+    `VideoFrame ROI capture: ${browserPerformance.browserRoiCapture.available ? browserPerformance.browserRoiCapture.passed ? "exact parity PASS" : "exact parity FAIL" : "unavailable"}; ${JSON.stringify(browserPerformance.browserRoiCapture)}`,
     `Secure context: ${isSecureContext}`,
     `GPU adapter: ${[adapterInfo?.vendor, adapterInfo?.architecture, adapterInfo?.description].filter(Boolean).join(" / ") || "details hidden by browser"}`,
     failures.slice(0, 5).map((failure) => `${failure.fixture}/${failure.waveformMode}/${failure.colorMatrix}: ${JSON.stringify(failure)}`).join("\n"),
@@ -304,10 +524,14 @@ try {
   ].filter(Boolean).join("\n");
   cpuScopes.destroy();
   gpuScopes.destroy();
+  await directDisplay.destroy();
+  sharedGpuDevice.destroy();
 } catch (error) {
   window.webscopesParityResult = { passed: false, error: error?.stack ?? String(error) };
   status.textContent += `\n\nGPU/CPU check failed:\n${error?.stack ?? error}`;
   console.error(error);
   cpuScopes?.destroy();
   gpuScopes?.destroy();
+  void directDisplay?.destroy();
+  sharedGpuDevice?.destroy();
 }

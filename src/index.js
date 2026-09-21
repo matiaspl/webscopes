@@ -1,9 +1,20 @@
-import { analyzeFrame, captureFrameToCanvas, getSourceSize, isRawPixelFrame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
+import { analyzeCapturedPixels, analyzeFrame, captureFrameToCanvas, getSourceSize, isRawPixelFrame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
 import { renderScopes } from "./render.js";
 import { generateTestSignalSlate, TEST_SIGNAL_COLOR_MATRICES, TEST_SIGNAL_COLOR_RANGES, TEST_SIGNAL_PATTERNS } from "./slates.js";
 import { createWebGpuAnalyzer } from "./webgpu.js";
+import { createCpuWorkerClient } from "./cpu-worker-client.js";
+
+export { createScopeDisplay } from "./webgpu.js";
 
 const VIDEO_TEXTURE_MODES = new Set(["auto", "copy", "external"]);
+
+function monotonicNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function elapsedSince(startedAt) {
+  return Math.max(0, monotonicNow() - startedAt);
+}
 
 function isSafariUserAgent(userAgent = globalThis.navigator?.userAgent ?? "") {
   return /Safari\//.test(userAgent)
@@ -53,6 +64,8 @@ export async function createScopes(options = {}) {
   let renderWarningReported = false;
   const cpuCapture = {};
   const browserSourceCapture = {};
+  const cpuWorker = createCpuWorkerClient();
+  let workerWarningReported = false;
 
   function releaseCpuCapture() {
     cpuCapture.canvas = undefined;
@@ -60,6 +73,7 @@ export async function createScopes(options = {}) {
     cpuCapture.data = undefined;
     cpuCapture.videoFrameReadback = undefined;
     cpuCapture.videoFramePixelFormat = undefined;
+    cpuCapture.videoFrameRoiCapture = undefined;
     browserSourceCapture.canvas = undefined;
     browserSourceCapture.context = undefined;
   }
@@ -69,7 +83,24 @@ export async function createScopes(options = {}) {
     // Live monitoring should show the newest frame, not build a queue of stale frames.
     if (currentUpdate) return currentUpdate;
     const task = (async () => {
-      const startedAt = globalThis.performance?.now?.() ?? Date.now();
+      const startedAt = monotonicNow();
+      const timing = { captureTimeMs: 0, analysisTimeMs: 0 };
+      const measureSync = (stage, operation) => {
+        const stageStartedAt = monotonicNow();
+        try {
+          return operation();
+        } finally {
+          timing[stage] += elapsedSince(stageStartedAt);
+        }
+      };
+      const measureAsync = async (stage, operation) => {
+        const stageStartedAt = monotonicNow();
+        try {
+          return await operation();
+        } finally {
+          timing[stage] += elapsedSince(stageStartedAt);
+        }
+      };
       const mergedOptions = { ...options, ...analysisOptions };
       const rawPixels = isRawPixelFrame(frame);
       const useGpu = backend === "webgpu" && !rawPixels;
@@ -78,6 +109,8 @@ export async function createScopes(options = {}) {
       normalizeAnalysisOptions(width, height, frameOptions);
       let frameBackend = useGpu ? "webgpu" : "cpu";
       let nextResult;
+      let captureBytes;
+      let captureUsedRoi;
       let analysisSource = frame;
       let ownsAnalysisSource = false;
       let sharedCanvasCapture;
@@ -90,34 +123,63 @@ export async function createScopes(options = {}) {
       const copyVideoToReusableCanvas = useGpu && gpuAnalyzer.videoTextureMode === "copy" && isVideoInput;
       if (!rawPixels && copyVideoToReusableCanvas) {
         try {
-          const browserSource = captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" });
+          const browserSource = measureSync("captureTimeMs", () => captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" }));
           analysisSource = browserSource.canvas;
         } catch {
           // Keep the browser source when a canvas snapshot is unavailable.
         }
-      } else if (!rawPixels && typeof globalThis.VideoFrame === "function" && !isVideoFrame) {
+      } else if (!rawPixels && typeof globalThis.VideoFrame === "function" && !isVideoFrame
+        && !(cpuWorker.available && !useGpu)) {
         try {
-          analysisSource = new globalThis.VideoFrame(frame, { timestamp: 0 });
+          analysisSource = measureSync("captureTimeMs", () => new globalThis.VideoFrame(frame, { timestamp: 0 }));
           ownsAnalysisSource = true;
         } catch {
           // Keep the original source when this browser cannot snapshot it as a VideoFrame.
         }
       }
-      if (!rawPixels && !copyVideoToReusableCanvas && !ownsAnalysisSource && !isVideoFrame && !(useGpu && isVideoSource)) {
+      if (!rawPixels && !copyVideoToReusableCanvas && !ownsAnalysisSource && !isVideoFrame && !(useGpu && isVideoSource)
+        && !(cpuWorker.available && !useGpu)) {
         try {
-          const browserSource = captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" });
-          sharedCanvasCapture = captureFrameToCanvas(browserSource.canvas, cpuCapture, { willReadFrequently: false, colorSpace: "srgb" });
+          const browserSource = measureSync("captureTimeMs", () => captureFrameToCanvas(frame, browserSourceCapture, { willReadFrequently: false, colorSpace: "srgb" }));
+          sharedCanvasCapture = measureSync("captureTimeMs", () => captureFrameToCanvas(browserSource.canvas, cpuCapture, { willReadFrequently: false, colorSpace: "srgb" }));
           analysisSource = sharedCanvasCapture.canvas;
         } catch {
           // Keep the original source when the browser cannot capture it to a canvas.
         }
       }
+      const analyzeCpu = async (source) => {
+        if (!rawPixels && cpuWorker.available) {
+          try {
+            const response = await cpuWorker.analyze(source, frameOptions);
+            timing.captureTimeMs += (response.snapshotTimeMs ?? 0) + (response.captureTimeMs ?? 0);
+            timing.analysisTimeMs += response.analysisTimeMs ?? 0;
+            captureBytes = response.captureBytes;
+            captureUsedRoi = response.captureUsedRoi;
+            return response.result;
+          } catch (error) {
+            if (destroyed) throw new Error("Scope analyzer has been destroyed");
+            cpuWorker.disable(error);
+            if (!workerWarningReported) {
+              workerWarningReported = true;
+              options.onWarning?.(`CPU VideoFrame worker unavailable; using main-thread analysis. ${error.message}`);
+            }
+          }
+        }
+        const pixels = sharedCanvasCapture
+          ? measureSync("captureTimeMs", () => sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height))
+          : await measureAsync("captureTimeMs", () => readFramePixelsAsync(source, cpuCapture, frameOptions));
+        if (!rawPixels) {
+          captureBytes = pixels.capturedByteLength ?? pixels.data?.byteLength;
+          captureUsedRoi = pixels.captureUsedRoi ?? false;
+        }
+        return measureSync("analysisTimeMs", () => analyzeCapturedPixels(pixels, frameOptions));
+      };
       try {
         if (useGpu) {
           try {
-            nextResult = isVideoInput
-              ? await gpuAnalyzer.analyzeVideo(analysisSource, frameOptions)
-              : await gpuAnalyzer.analyze(analysisSource, frameOptions);
+            nextResult = await measureAsync("analysisTimeMs", () => isVideoInput
+              ? gpuAnalyzer.analyzeVideo(analysisSource, frameOptions)
+              : gpuAnalyzer.analyze(analysisSource, frameOptions));
           } catch (error) {
             if (destroyed) throw new Error("Scope analyzer has been destroyed");
             if (requestedBackend !== "auto" || backend !== "webgpu") throw error;
@@ -126,26 +188,17 @@ export async function createScopes(options = {}) {
             gpuAnalyzer = undefined;
             backend = "cpu";
             frameBackend = "cpu";
-            nextResult = analyzeFrame(
-              sharedCanvasCapture
-                ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
-                : await readFramePixelsAsync(analysisSource, cpuCapture),
-              frameOptions,
-            );
+            nextResult = await analyzeCpu(analysisSource);
           }
         } else {
-          nextResult = analyzeFrame(
-            sharedCanvasCapture
-              ? sharedCanvasCapture.context.getImageData(0, 0, sharedCanvasCapture.width, sharedCanvasCapture.height)
-              : await readFramePixelsAsync(analysisSource, cpuCapture),
-            frameOptions,
-          );
+          nextResult = await analyzeCpu(analysisSource);
         }
       } finally {
         if (ownsAnalysisSource) analysisSource.close();
       }
       if (destroyed) throw new Error("Scope analyzer has been destroyed");
-      const frameTimeMs = Math.max(0, (globalThis.performance?.now?.() ?? Date.now()) - startedAt);
+      // Legacy frame timing intentionally ends after capture and analysis, before rendering.
+      const frameTimeMs = elapsedSince(startedAt);
       averageFrameTimeMs = averageFrameTimeMs === undefined
         ? frameTimeMs
         : averageFrameTimeMs + (frameTimeMs - averageFrameTimeMs) * 0.2;
@@ -155,12 +208,25 @@ export async function createScopes(options = {}) {
         ...nextResult,
         stats: {
           ...nextResult.stats,
-          performance: { backend: frameBackend, frameTimeMs, fps, averageFrameTimeMs, averageFps },
+          performance: {
+            backend: frameBackend,
+            frameTimeMs,
+            fps,
+            averageFrameTimeMs,
+            averageFps,
+            captureTimeMs: timing.captureTimeMs,
+            analysisTimeMs: timing.analysisTimeMs,
+            renderTimeMs: 0,
+            updateTimeMs: 0,
+            captureBytes,
+            captureUsedRoi,
+          },
         },
       };
       if (destroyed) throw new Error("Scope analyzer has been destroyed");
-      currentResult = nextResult;
+      let renderTimeMs = 0;
       if (canvas && (options.autoRender ?? true) && !renderingDisabled) {
+        const renderStartedAt = monotonicNow();
         try {
           renderScopes(nextResult, canvas, options.renderOptions);
         } catch (error) {
@@ -174,8 +240,23 @@ export async function createScopes(options = {}) {
             renderWarningReported = true;
             options.onWarning?.(`Scope display disabled after a canvas allocation failure; analysis continues. ${error.message}`);
           }
+        } finally {
+          renderTimeMs = elapsedSince(renderStartedAt);
         }
       }
+      if (destroyed) throw new Error("Scope analyzer has been destroyed");
+      nextResult = {
+        ...nextResult,
+        stats: {
+          ...nextResult.stats,
+          performance: {
+            ...nextResult.stats.performance,
+            renderTimeMs,
+            updateTimeMs: elapsedSince(startedAt),
+          },
+        },
+      };
+      currentResult = nextResult;
       return nextResult;
     })();
     currentUpdate = task.finally(() => { currentUpdate = undefined; });
@@ -199,6 +280,7 @@ export async function createScopes(options = {}) {
     },
     destroy() {
       destroyed = true;
+      cpuWorker.destroy();
       gpuAnalyzer?.destroy();
       gpuAnalyzer = undefined;
       currentResult = undefined;

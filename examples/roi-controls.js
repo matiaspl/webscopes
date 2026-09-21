@@ -12,26 +12,52 @@ export function regionForPreset(preset) {
   return { x: 0, y: 0, width: 1, height: 1 };
 }
 
-export function createFramePacer() {
+export function createFramePacer({ maxRefreshRate, now = () => globalThis.performance?.now?.() ?? Date.now() } = {}) {
+  if (typeof now !== "function") throw new TypeError("now must be a function");
   let hasFrame = false;
   let lastFrameToken;
   let lastRegionRevision;
   let lastScopes;
+  let lastAnalysisAt;
+  let refreshIntervalMs;
+
+  function setMaxRefreshRate(rate) {
+    if (rate === undefined || rate === null) {
+      refreshIntervalMs = undefined;
+      return;
+    }
+    const numericRate = Number(rate);
+    if (!Number.isFinite(numericRate) || numericRate <= 0) {
+      throw new RangeError("maxRefreshRate must be a positive finite number");
+    }
+    refreshIntervalMs = 1_000 / numericRate;
+  }
+
+  setMaxRefreshRate(maxRefreshRate);
   return {
-    shouldAnalyze(frameToken, regionRevision, scopes) {
-      if (hasFrame && Object.is(frameToken, lastFrameToken)
+    shouldAnalyze(frameToken, regionRevision, scopes, { force = false } = {}) {
+      if (!force && hasFrame && Object.is(frameToken, lastFrameToken)
         && regionRevision === lastRegionRevision && scopes === lastScopes) return false;
+      const analyzedAt = now();
+      if (!force && refreshIntervalMs !== undefined && lastAnalysisAt !== undefined
+        && analyzedAt - lastAnalysisAt < refreshIntervalMs) return false;
       hasFrame = true;
       lastFrameToken = frameToken;
       lastRegionRevision = regionRevision;
       lastScopes = scopes;
+      lastAnalysisAt = analyzedAt;
       return true;
+    },
+    setMaxRefreshRate,
+    complete() {
+      if (hasFrame) lastAnalysisAt = now();
     },
     reset() {
       hasFrame = false;
       lastFrameToken = undefined;
       lastRegionRevision = undefined;
       lastScopes = undefined;
+      lastAnalysisAt = undefined;
     },
   };
 }
@@ -91,17 +117,30 @@ export function bindRoiSelection(stage, controller, pointToSource) {
 
 export function createRoiRefreshScheduler({ requestFrame, cancelFrame, run }) {
   let frame;
+  let cancelFrameForRequest;
   let pending = false;
   let inFlight = false;
   let revision = 0;
   let closing = false;
+  let suspended = false;
+
+  function cancelQueuedFrame() {
+    if (frame === undefined) return;
+    cancelFrameForRequest?.(frame);
+    frame = undefined;
+    cancelFrameForRequest = undefined;
+  }
 
   function queue() {
-    if (closing || !pending || inFlight || frame !== undefined) return;
+    if (closing || suspended || !pending || inFlight || frame !== undefined) return;
+    const cancelThisFrame = cancelFrame;
+    cancelFrameForRequest = cancelThisFrame;
     frame = requestFrame(() => {
       frame = undefined;
-      if (closing || !pending) return;
-      const analysis = run();
+      cancelFrameForRequest = undefined;
+      if (closing || suspended || !pending) return;
+      const runRevision = revision;
+      const analysis = run({ revision: runRevision, force: true });
       if (!analysis) return;
       pending = false;
       inFlight = true;
@@ -124,14 +163,28 @@ export function createRoiRefreshScheduler({ requestFrame, cancelFrame, run }) {
       queue();
       return revision;
     },
-    resume: queue,
+    suspend() {
+      if (closing) return;
+      suspended = true;
+      cancelQueuedFrame();
+    },
+    resume() {
+      if (closing) return;
+      suspended = false;
+      queue();
+    },
+    rebind() {
+      if (closing) return;
+      cancelQueuedFrame();
+      queue();
+    },
     destroy() {
       closing = true;
       pending = false;
-      if (frame !== undefined) cancelFrame(frame);
-      frame = undefined;
+      cancelQueuedFrame();
     },
     get pending() { return pending; },
     get revision() { return revision; },
+    get suspended() { return suspended; },
   };
 }

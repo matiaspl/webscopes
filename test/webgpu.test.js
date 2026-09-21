@@ -317,6 +317,109 @@ test("createScopes sends a VideoFrame snapshot to the WebGPU external-texture pa
   }
 });
 
+test("createScopes separates asynchronous analysis, automatic rendering, and total update timing", async () => {
+  const restoreGpu = installGpuConstants();
+  const originalPerformance = globalThis.performance;
+  let now = 0;
+  globalThis.performance = { now: () => now };
+  const mapStarted = deferred();
+  const mapGate = deferred();
+  let renderCalls = 0;
+  const context = {
+    canvas: { width: 320, height: 180 },
+    createImageData(width, height) { return { width, height, data: new Uint8ClampedArray(width * height * 4) }; },
+    putImageData() { renderCalls += 1; now += 5; },
+    fillRect() {}, save() {}, restore() {}, setLineDash() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {},
+    fillText() {}, arc() {}, fill() {},
+  };
+  try {
+    const device = mockDevice({ mapStarted, mapGate });
+    const scopes = await createScopes({ backend: "webgpu", device, canvas: context });
+    const pending = scopes.update({ width: 1, height: 1 }, {
+      waveformWidth: 1,
+      waveformHeight: 16,
+      vectorscopeSize: 64,
+    });
+    await mapStarted.promise;
+    now = 23;
+    mapGate.resolve();
+    const result = await pending;
+    const performanceStats = result.stats.performance;
+    assert.equal(performanceStats.frameTimeMs, 23, "legacy timing ends after analysis and before rendering");
+    assert.equal(performanceStats.analysisTimeMs, 23, "analysis timing includes the asynchronous histogram readback wait");
+    assert.equal(performanceStats.captureTimeMs, 0);
+    assert.equal(performanceStats.renderTimeMs, renderCalls * 5);
+    assert.equal(performanceStats.updateTimeMs, 23 + renderCalls * 5);
+
+    const previousTiming = { ...performanceStats };
+    scopes.render();
+    assert.deepEqual(result.stats.performance, previousTiming, "standalone render does not rewrite update timing");
+    scopes.destroy();
+
+    const noRenderScopes = await createScopes({ backend: "cpu", autoRender: false });
+    const noRenderResult = await noRenderScopes.update({
+      width: 1,
+      height: 1,
+      data: new Uint8Array([0, 0, 0, 255]),
+    });
+    assert.equal(noRenderResult.stats.performance.renderTimeMs, 0);
+    noRenderScopes.destroy();
+  } finally {
+    globalThis.performance = originalPerformance;
+    restoreGpu();
+  }
+});
+
+test("createScopes times source capture and keeps failed GPU work in the CPU fallback update", async () => {
+  const restoreConstants = installGpuConstants();
+  const originalPerformance = globalThis.performance;
+  const originalVideoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+  let now = 0;
+  globalThis.performance = { now: () => now };
+  class FakeVideoFrame {
+    constructor(source) {
+      this.displayWidth = source.videoWidth;
+      this.displayHeight = source.videoHeight;
+      now += 4;
+    }
+    async copyTo(destination) {
+      now += 9;
+      destination.set([32, 64, 96, 255]);
+    }
+    close() {}
+  }
+  globalThis.VideoFrame = FakeVideoFrame;
+  const mapStarted = deferred();
+  const mapGate = deferred();
+  let scopes;
+  try {
+    scopes = await createScopes({
+      backend: "auto",
+      device: mockDevice({ mapStarted, mapGate, mapThrows: true }),
+      autoRender: false,
+    });
+    const pending = scopes.update({ videoWidth: 1, videoHeight: 1, currentTime: 0 });
+    await mapStarted.promise;
+    now = 20;
+    mapGate.resolve();
+    const result = await pending;
+    const performanceStats = result.stats.performance;
+
+    assert.equal(performanceStats.backend, "cpu");
+    assert.equal(performanceStats.captureTimeMs, 13, "VideoFrame snapshot and fallback pixel readback are capture work");
+    assert.equal(performanceStats.analysisTimeMs, 16, "failed asynchronous GPU work remains in analysis time");
+    assert.equal(performanceStats.frameTimeMs, 29, "legacy processing time includes GPU failure and CPU fallback");
+    assert.equal(performanceStats.renderTimeMs, 0);
+    assert.equal(performanceStats.updateTimeMs, 29, "the full fallback path remains in total update time");
+  } finally {
+    scopes?.destroy();
+    globalThis.performance = originalPerformance;
+    if (originalVideoFrame === undefined) delete globalThis.VideoFrame;
+    else Object.defineProperty(globalThis, "VideoFrame", originalVideoFrame);
+    restoreConstants();
+  }
+});
+
 test("createScopes uses reusable texture copies for Safari video inputs by default", async () => {
   const restore = installGpuConstants();
   const previousVideoFrame = globalThis.VideoFrame;

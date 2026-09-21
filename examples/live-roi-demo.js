@@ -1,15 +1,17 @@
-import { createScopes, generateTestSignalSlate } from "../src/index.js";
+import { createScopeDisplay, createScopes, generateTestSignalSlate } from "../src/index.js";
 import { bindRoiSelection, createFramePacer, createRoiRefreshScheduler, createRoiSelectionController, regionForPreset } from "./roi-controls.js";
+import { computeScopeCanvasSize, createQualityProfileState, createRollingRate } from "./mobile-performance.js";
 
 const DEMO_STREAM = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
 const SAGRADA_VIDEO_API = "https://api-media.ccma.cat/pvideo/media.jsp?media=video&versio=vast&idint=6409478&profile=pc_3cat&format=dm";
 const YOUTUBE_SOURCE = "https://www.youtube.com/watch?v=odBWmbca9sc";
-const DEMO_RENDER_OPTIONS = Object.freeze({ dither: 0, vectorscopeDither: 0 });
+const DEMO_RENDER_OPTIONS = Object.freeze({ dither: 0, vectorscopeDither: 0, devicePixelRatio: 1 });
 const video = document.querySelector("#video");
 const slatePreview = document.querySelector("#slate-preview");
 const stage = document.querySelector("#stage");
 const roiBox = document.querySelector("#roi-box");
-const scopeCanvas = document.querySelector("#scope");
+let scopeCanvas = document.querySelector("#scope");
+const legacyScopeCanvas = scopeCanvas;
 const scopeCanvasHome = scopeCanvas.parentElement;
 const scopePanel = scopeCanvas.closest(".panel");
 const status = document.querySelector("#status");
@@ -26,9 +28,11 @@ const chooseFileButton = document.querySelector("#choose-file");
 const shareScreenButton = document.querySelector("#share-screen");
 const fileInput = document.querySelector("#file-input");
 const backendSelect = document.querySelector("#backend");
+const rendererSelect = document.querySelector("#renderer");
 const matrixSelect = document.querySelector("#matrix");
 const rangeSelect = document.querySelector("#range");
 const waveformSelect = document.querySelector("#waveform");
+const qualityProfileSelect = document.querySelector("#quality-profile");
 const probeResolutionSelect = document.querySelector("#probe-resolution");
 const sourceInput = document.querySelector("#source");
 const sourceLabel = document.querySelector("#source-label");
@@ -43,15 +47,28 @@ const popoutButton = document.querySelector("#popout-scopes");
 
 let region = { x: 0, y: 0, width: 1, height: 1 };
 let scopes;
+let scopeDisplay;
+let scopeRenderer = "canvas2d";
+let rendererGeneration = 0;
+let latestDisplayMetadata;
 let hls;
 let dashPlayer;
 let videoFrameCallback;
+let videoFrameCallbackOwner;
 let animationFrame;
+let animationFrameOwner;
+let scopeResizeObserver;
+let scopeResizeFallbackWindow;
+let scopeResizeFrame;
+let scopeResizeFrameOwner;
+let observedScopeDocument;
 let activeAnalysis;
 let activeAnalysisRegionRevision;
 let activeAnalysisScopes;
 let lastFallbackTime = -1;
-const framePacer = createFramePacer();
+const qualityProfile = createQualityProfileState(qualityProfileSelect.value || "standard");
+const completedUpdateRate = createRollingRate({ windowMs: 5_000 });
+const framePacer = createFramePacer({ now: () => performance.now() });
 let activeFileUrl;
 let activeSlate;
 let displayStream;
@@ -61,7 +78,6 @@ let scopeGeneration = 0;
 let streamGeneration = 0;
 let popoutWindow;
 let backend = new URLSearchParams(location.search).get("backend") ?? "auto";
-let probeResolution = Number(probeResolutionSelect.value);
 
 if (!["auto", "cpu", "webgpu"].includes(backend)) backend = "auto";
 backendSelect.value = backend;
@@ -161,6 +177,8 @@ function seekBy(seconds) {
 }
 
 function releaseCurrentSource() {
+  cancelScheduledAnalysis();
+  resetDemoMeasurements();
   nativeSourceAbortController?.abort();
   nativeSourceAbortController = undefined;
   hls?.destroy();
@@ -224,7 +242,14 @@ function pointToSource(event) {
 }
 
 function currentAnalysisOptions() {
-  const options = { inputResolutionScaling: probeResolution, waveformMode: waveformSelect.value };
+  const profile = qualityProfile.current;
+  const options = {
+    inputResolutionScaling: profile.inputResolutionScaling,
+    waveformWidth: profile.waveformWidth,
+    waveformHeight: profile.waveformHeight,
+    vectorscopeSize: profile.vectorscopeSize,
+    waveformMode: waveformSelect.value,
+  };
   if (matrixSelect.value) options.colorMatrix = matrixSelect.value;
   else if (activeSlate?.nativeColorMatrix) options.colorMatrix = activeSlate.nativeColorMatrix;
   if (rangeSelect.value) options.colorRange = rangeSelect.value;
@@ -233,7 +258,13 @@ function currentAnalysisOptions() {
 }
 
 function probeResolutionLabel() {
-  return probeResolution === 1 ? "100% native probe" : `${Math.round(probeResolution * 100)}% sparse probe`;
+  const inputResolutionScaling = qualityProfile.current.inputResolutionScaling;
+  return inputResolutionScaling === 1 ? "100% native probe" : `${Math.round(inputResolutionScaling * 100)}% sparse probe`;
+}
+
+function resetDemoMeasurements() {
+  completedUpdateRate.reset();
+  videoMeta.textContent = "Waiting for completed scope updates";
 }
 
 function updateColorLegend() {
@@ -249,9 +280,109 @@ function resetPopoutState() {
   popoutButton.textContent = "Pop out scopes";
 }
 
+function replaceScopeCanvas(nextCanvas) {
+  if (scopeCanvas === nextCanvas) return;
+  const current = scopeCanvas;
+  if (current.parentElement) current.replaceWith(nextCanvas);
+  else scopeCanvasHome.append(nextCanvas);
+  nextCanvas.id = legacyScopeCanvas.id;
+  nextCanvas.setAttribute("aria-label", legacyScopeCanvas.getAttribute("aria-label") ?? "Live waveform and vectorscope");
+  scopeCanvas = nextCanvas;
+  syncScopeOwner();
+}
+
+async function restoreCanvasRenderer(reason) {
+  rendererGeneration += 1;
+  const previousDisplay = scopeDisplay;
+  scopeDisplay = undefined;
+  scopeRenderer = "canvas2d";
+  latestDisplayMetadata = undefined;
+  rendererSelect.value = "canvas2d";
+  replaceScopeCanvas(legacyScopeCanvas);
+  resetDemoMeasurements();
+  framePacer.reset();
+  scheduleScopeResize();
+  if (reason && !pageIsClosing) setStatus(reason, "error");
+  if (previousDisplay) {
+    try { await previousDisplay.destroy(); } catch {}
+  }
+}
+
+function createFreshScopeCanvas() {
+  const owner = scopeCanvas.ownerDocument ?? document;
+  const canvas = owner.createElement("canvas");
+  canvas.width = scopeCanvas.width;
+  canvas.height = scopeCanvas.height;
+  canvas.style.cssText = scopeCanvas.style.cssText;
+  canvas.className = legacyScopeCanvas.className;
+  canvas.setAttribute("aria-label", legacyScopeCanvas.getAttribute("aria-label") ?? "Live waveform and vectorscope");
+  return canvas;
+}
+
+async function selectRenderer(nextRenderer) {
+  const generation = ++rendererGeneration;
+  if (nextRenderer !== "webgpu") {
+    await restoreCanvasRenderer();
+    return;
+  }
+  if (backendSelect.value === "cpu") {
+    rendererSelect.value = "canvas2d";
+    setStatus("WebGPU direct display needs GPU analysis; Canvas2D remains active in CPU mode.", "error");
+    return;
+  }
+  if (activeSlate?.frame?.format === "v210") {
+    rendererSelect.value = "canvas2d";
+    setStatus("WebGPU direct display accepts decoded browser sources. The 10-bit v210 slate stays on the Canvas2D path.", "error");
+    return;
+  }
+  const nextCanvas = createFreshScopeCanvas();
+  let nextDisplay;
+  try {
+    nextDisplay = await createScopeDisplay({
+      canvas: nextCanvas,
+      videoTextureMode: "auto",
+      renderOptions: { ...DEMO_RENDER_OPTIONS, showPerformance: false },
+      onQueueCompleted(event) {
+        if (scopeRenderer !== "webgpu" || pageIsClosing) return;
+        const updatesPerSecond = completedUpdateRate.record(globalThis.performance?.now?.() ?? Date.now());
+        const metadata = latestDisplayMetadata;
+        const width = metadata?.width ?? video.videoWidth;
+        const height = metadata?.height ?? video.videoHeight;
+        videoMeta.textContent = `WEBGPU direct · ${width}×${height} · ${qualityProfile.current.label} · ${probeResolutionLabel()} · ${updatesPerSecond.toFixed(0)} queue-completed/s · ${event.submittedFrames} submitted / ${event.queueCompletedFrames} queue-completed`;
+      },
+      onDeviceLost(error) {
+        void restoreCanvasRenderer(`WebGPU display lost its device; Canvas2D fallback is active. ${error.message}`);
+      },
+      onError(error) {
+        if (!pageIsClosing) setStatus(`WebGPU display queue failed: ${error.message}`, "error");
+      },
+    });
+  } catch (error) {
+    if (generation === rendererGeneration) {
+      scopeRenderer = "canvas2d";
+      rendererSelect.value = "canvas2d";
+      setStatus(`WebGPU direct display could not start; Canvas2D remains active. ${error.message}`, "error");
+    }
+    return;
+  }
+  if (generation !== rendererGeneration || pageIsClosing) {
+    await nextDisplay.destroy();
+    return;
+  }
+  scopeDisplay = nextDisplay;
+  scopeRenderer = "webgpu";
+  latestDisplayMetadata = undefined;
+  completedUpdateRate.reset();
+  framePacer.reset();
+  replaceScopeCanvas(nextCanvas);
+  scheduleScopeResize();
+  if (activeSlate || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) scheduleRegionRefresh();
+}
+
 function restoreScopeCanvas() {
   if (scopeCanvas.parentElement !== scopeCanvasHome) scopeCanvasHome.append(scopeCanvas);
   scopePanel.hidden = false;
+  syncScopeOwner();
 }
 
 function handlePopoutClosed() {
@@ -296,6 +427,7 @@ function openPopout() {
   nextWindow.addEventListener("pagehide", handlePopoutClosed, { once: true });
   popoutWindow = nextWindow;
   popoutButton.textContent = "Close scopes pop-out";
+  syncScopeOwner();
   popoutWindow.focus();
 }
 
@@ -316,19 +448,27 @@ document.querySelectorAll("[data-region]").forEach((button) => {
 });
 
 async function configureScopes(nextBackend) {
+  if (nextBackend === "cpu" && scopeRenderer === "webgpu") {
+    await restoreCanvasRenderer("CPU backend selected; Canvas2D display is active.");
+  }
   const generation = ++scopeGeneration;
+  cancelScheduledAnalysis();
+  resetDemoMeasurements();
+  framePacer.reset();
   scopes?.destroy();
   scopes = undefined;
   backend = nextBackend;
   try {
+    const profile = qualityProfile.current;
     const nextScopes = await createScopes({
-      canvas: scopeCanvas,
+      canvas: legacyScopeCanvas,
       backend,
+      autoRender: true,
       waveformMode: waveformSelect.value,
-      waveformWidth: 480,
-      waveformHeight: 512,
-      vectorscopeSize: 256,
-      inputResolutionScaling: probeResolution,
+      waveformWidth: profile.waveformWidth,
+      waveformHeight: profile.waveformHeight,
+      vectorscopeSize: profile.vectorscopeSize,
+      inputResolutionScaling: profile.inputResolutionScaling,
       renderOptions: DEMO_RENDER_OPTIONS,
       onWarning(message) {
         if (!pageIsClosing && generation === scopeGeneration) setStatus(message);
@@ -340,10 +480,8 @@ async function configureScopes(nextBackend) {
     }
     scopes = nextScopes;
     videoMeta.textContent = `${scopes.backend.toUpperCase()} · waiting for video`;
-    if (activeSlate || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-      if (roiRefresh.pending) roiRefresh.resume();
-      else analyzeCurrentFrame();
-    }
+    if (activeSlate || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) scheduleRegionRefresh();
+    scheduleAnalysis();
   } catch (error) {
     if (generation !== scopeGeneration) return;
     videoMeta.textContent = "Backend unavailable";
@@ -351,7 +489,7 @@ async function configureScopes(nextBackend) {
   }
 }
 
-function analyzeCurrentFrame(mediaTime = video.currentTime, frameToken = mediaTime) {
+function analyzeCurrentFrame(mediaTime = video.currentTime, frameToken = mediaTime, force = false) {
   if (pageIsClosing || !scopes || (!activeSlate && video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA)) return undefined;
   if (activeAnalysis && activeAnalysisScopes === scopes) {
     return { promise: activeAnalysis, regionRevision: activeAnalysisRegionRevision };
@@ -359,19 +497,50 @@ function analyzeCurrentFrame(mediaTime = video.currentTime, frameToken = mediaTi
   const activeScopes = scopes;
   const usedStreamGeneration = streamGeneration;
   const usedRegionRevision = roiRefresh.revision;
-  if (!framePacer.shouldAnalyze(frameToken, usedRegionRevision, activeScopes)) return undefined;
+  if (!framePacer.shouldAnalyze(frameToken, usedRegionRevision, activeScopes, { force })) return undefined;
   const usedRegion = { ...region };
   const source = activeSlate?.frame ?? video;
-  const tracked = activeScopes.update(source, { ...currentAnalysisOptions(), region: usedRegion }).then((result) => {
+  const rawSource = source && typeof source === "object" && (source.format === "v210" || ArrayBuffer.isView(source.data));
+  if (scopeRenderer === "webgpu" && rawSource) {
+    void restoreCanvasRenderer("Raw or high-bit-depth frames use the existing Canvas2D analyzer.");
+  }
+  const directDisplay = scopeRenderer === "webgpu" && !rawSource ? scopeDisplay : undefined;
+  const analysisOptions = { ...currentAnalysisOptions(), region: usedRegion };
+  const updateTask = directDisplay
+    ? directDisplay.present(source, analysisOptions)
+    : activeScopes.update(source, analysisOptions);
+  const tracked = updateTask.then(async (result) => {
     if (pageIsClosing || scopes !== activeScopes || streamGeneration !== usedStreamGeneration) return;
+    if (directDisplay) {
+      if (result.status !== "submitted") return;
+      latestDisplayMetadata = result.metadata;
+      videoMeta.textContent = `WEBGPU direct · ${result.metadata.width}×${result.metadata.height} · ${qualityProfile.current.label} · ${probeResolutionLabel()} · frame ${result.frameId} submitted · ${result.submissionTimeMs.toFixed(1)} ms to queue`;
+      return;
+    }
     const perf = result.stats.performance;
     const width = activeSlate?.frame.width ?? video.videoWidth;
     const height = activeSlate?.frame.height ?? video.videoHeight;
-    videoMeta.textContent = `${perf.backend.toUpperCase()} · ${width}×${height} · ${probeResolutionLabel()} · ${perf.averageFps.toFixed(0)} scope FPS`;
-  }).catch((error) => {
+    const updatesPerSecond = completedUpdateRate.record(globalThis.performance?.now?.() ?? Date.now());
+    videoMeta.textContent = `${perf.backend.toUpperCase()} · ${width}×${height} · ${qualityProfile.current.label} · ${probeResolutionLabel()} · ${updatesPerSecond.toFixed(0)} updates/s · ${(perf.updateTimeMs ?? perf.frameTimeMs).toFixed(1)} ms update`;
+  }).catch(async (error) => {
+    if (directDisplay) {
+      if (scopeDisplay === directDisplay) {
+        await restoreCanvasRenderer(`WebGPU direct display failed; Canvas2D fallback is active. ${error.message}`);
+      }
+      if (!pageIsClosing && scopes === activeScopes && streamGeneration === usedStreamGeneration) {
+        const result = await activeScopes.update(source, analysisOptions);
+        const perf = result.stats.performance;
+        const width = activeSlate?.frame.width ?? video.videoWidth;
+        const height = activeSlate?.frame.height ?? video.videoHeight;
+        const updatesPerSecond = completedUpdateRate.record(globalThis.performance?.now?.() ?? Date.now());
+        videoMeta.textContent = `${perf.backend.toUpperCase()} · ${width}×${height} · ${qualityProfile.current.label} · ${probeResolutionLabel()} · ${updatesPerSecond.toFixed(0)} updates/s · ${(perf.updateTimeMs ?? perf.frameTimeMs).toFixed(1)} ms update`;
+      }
+      return;
+    }
     if (!pageIsClosing && scopes === activeScopes && streamGeneration === usedStreamGeneration) setStatus(`Scope analysis stopped: ${error.message}`, "error");
   }).finally(() => {
     if (activeAnalysis === tracked) {
+      framePacer.complete();
       activeAnalysis = undefined;
       activeAnalysisScopes = undefined;
       activeAnalysisRegionRevision = undefined;
@@ -383,11 +552,147 @@ function analyzeCurrentFrame(mediaTime = video.currentTime, frameToken = mediaTi
   return { promise: tracked, regionRevision: usedRegionRevision };
 }
 
+function scopeOwnerDocument() {
+  return scopeCanvas.ownerDocument ?? document;
+}
+
+function scopeOwnerWindow() {
+  return scopeOwnerDocument().defaultView ?? window;
+}
+
+function requestScopeFrame(callback) {
+  const owner = scopeOwnerWindow();
+  return { owner, id: owner.requestAnimationFrame(callback) };
+}
+
+function cancelScopeFrame(frame) {
+  frame?.owner?.cancelAnimationFrame(frame.id);
+}
+
 const roiRefresh = createRoiRefreshScheduler({
-  requestFrame: (callback) => requestAnimationFrame(callback),
-  cancelFrame: (frame) => cancelAnimationFrame(frame),
-  run: analyzeCurrentFrame,
+  requestFrame: requestScopeFrame,
+  cancelFrame: cancelScopeFrame,
+  run: () => analyzeCurrentFrame(undefined, undefined, true),
 });
+
+function cancelScheduledAnalysis() {
+  if (videoFrameCallback !== undefined) {
+    videoFrameCallbackOwner?.cancelVideoFrameCallback?.(videoFrameCallback);
+  }
+  if (animationFrame !== undefined) {
+    animationFrameOwner?.cancelAnimationFrame?.(animationFrame);
+  }
+  videoFrameCallback = undefined;
+  videoFrameCallbackOwner = undefined;
+  animationFrame = undefined;
+  animationFrameOwner = undefined;
+}
+
+function cancelScopeResizeFrame() {
+  if (scopeResizeFrame !== undefined) scopeResizeFrameOwner?.cancelAnimationFrame?.(scopeResizeFrame);
+  scopeResizeFrame = undefined;
+  scopeResizeFrameOwner = undefined;
+}
+
+function scheduleScopeResize() {
+  if (pageIsClosing || scopeResizeFrame !== undefined) return;
+  const owner = scopeOwnerWindow();
+  if (typeof owner.requestAnimationFrame !== "function") return;
+  scopeResizeFrameOwner = owner;
+  scopeResizeFrame = owner.requestAnimationFrame(() => {
+    scopeResizeFrame = undefined;
+    scopeResizeFrameOwner = undefined;
+    const container = scopeCanvas.parentElement;
+    if (!container) return;
+    const style = owner.getComputedStyle(container);
+    const padding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    const availableWidth = Math.max(0, container.clientWidth - padding);
+    const size = computeScopeCanvasSize(availableWidth, qualityProfile.current);
+    if (!size) return;
+    const cssWidth = `${size.width}px`;
+    const cssHeight = `${size.height}px`;
+    const changed = scopeCanvas.width !== size.width || scopeCanvas.height !== size.height
+      || scopeCanvas.style.width !== cssWidth || scopeCanvas.style.height !== cssHeight;
+    if (!changed) return;
+    scopeCanvas.width = size.width;
+    scopeCanvas.height = size.height;
+    scopeCanvas.style.width = cssWidth;
+    scopeCanvas.style.height = cssHeight;
+    if (scopes?.result) {
+      try { scopes.render(); } catch { /* Resize must not stop source analysis. */ }
+    }
+  });
+}
+
+function observeScopeContainer() {
+  scopeResizeObserver?.disconnect();
+  scopeResizeObserver = undefined;
+  if (scopeResizeFallbackWindow) {
+    scopeResizeFallbackWindow.removeEventListener("resize", scheduleScopeResize);
+    scopeResizeFallbackWindow = undefined;
+  }
+  cancelScopeResizeFrame();
+  if (pageIsClosing) return;
+  const container = scopeCanvas.parentElement;
+  if (!container) return;
+  const owner = scopeOwnerWindow();
+  if (typeof owner.ResizeObserver === "function") {
+    scopeResizeObserver = new owner.ResizeObserver(scheduleScopeResize);
+    scopeResizeObserver.observe(container);
+  } else {
+    scopeResizeFallbackWindow = owner;
+    owner.addEventListener("resize", scheduleScopeResize);
+  }
+  scheduleScopeResize();
+}
+
+function scopeOwnerIsHidden() {
+  const ownerDocument = scopeOwnerDocument();
+  return ownerDocument.hidden === true || ownerDocument.visibilityState === "hidden";
+}
+
+function handleScopeVisibilityChange() {
+  resetDemoMeasurements();
+  framePacer.reset();
+  cancelScheduledAnalysis();
+  if (scopeOwnerIsHidden()) {
+    roiRefresh.suspend();
+    return;
+  }
+  roiRefresh.resume();
+  if (scopes && (activeSlate || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA)) scheduleRegionRefresh();
+  scheduleAnalysis();
+}
+
+function syncScopeOwner() {
+  if (pageIsClosing) {
+    observedScopeDocument?.removeEventListener("visibilitychange", handleScopeVisibilityChange);
+    observedScopeDocument = undefined;
+    cancelScheduledAnalysis();
+    observeScopeContainer();
+    return;
+  }
+  const nextDocument = scopeOwnerDocument();
+  if (nextDocument === observedScopeDocument) {
+    observeScopeContainer();
+    return;
+  }
+  observedScopeDocument?.removeEventListener("visibilitychange", handleScopeVisibilityChange);
+  cancelScheduledAnalysis();
+  resetDemoMeasurements();
+  framePacer.reset();
+  observedScopeDocument = nextDocument;
+  observedScopeDocument.addEventListener("visibilitychange", handleScopeVisibilityChange);
+  observeScopeContainer();
+  roiRefresh.rebind();
+  if (scopeOwnerIsHidden()) {
+    roiRefresh.suspend();
+    return;
+  }
+  roiRefresh.resume();
+  if (scopes && (activeSlate || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA)) scheduleRegionRefresh();
+  scheduleAnalysis();
+}
 
 function scheduleRegionRefresh() {
   if (!pageIsClosing) roiRefresh.schedule();
@@ -395,15 +700,19 @@ function scheduleRegionRefresh() {
 
 function scheduleAnalysis() {
   if (pageIsClosing) return;
-  if (activeSlate) {
-    analyzeCurrentFrame("slate", `slate:${streamGeneration}`);
+  if (scopeOwnerIsHidden()) {
+    cancelScheduledAnalysis();
+    roiRefresh.suspend();
     return;
   }
+  if (activeSlate) return;
   if (video.paused || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return;
-  if (video.requestVideoFrameCallback) {
+  if (scopeOwnerDocument() === document && video.requestVideoFrameCallback) {
     if (videoFrameCallback !== undefined) return;
+    videoFrameCallbackOwner = video;
     videoFrameCallback = video.requestVideoFrameCallback((_now, metadata) => {
       videoFrameCallback = undefined;
+      videoFrameCallbackOwner = undefined;
       const mediaTime = Number.isFinite(metadata?.mediaTime) ? metadata.mediaTime : video.currentTime;
       // Live sources can report a coarse or unchanged mediaTime. presentedFrames
       // identifies each displayed frame and keeps measurements running.
@@ -414,11 +723,14 @@ function scheduleAnalysis() {
     return;
   }
   if (animationFrame !== undefined) return;
-  animationFrame = requestAnimationFrame(() => {
+  animationFrameOwner = scopeOwnerWindow();
+  animationFrame = animationFrameOwner.requestAnimationFrame(() => {
     animationFrame = undefined;
-    if (!pageIsClosing && !video.paused && video.currentTime !== lastFallbackTime) {
-      lastFallbackTime = video.currentTime;
-      analyzeCurrentFrame();
+    animationFrameOwner = undefined;
+    if (!pageIsClosing && !scopeOwnerIsHidden() && !video.paused && video.currentTime !== lastFallbackTime) {
+      const mediaTime = video.currentTime;
+      lastFallbackTime = mediaTime;
+      analyzeCurrentFrame(mediaTime, mediaTime);
     }
     scheduleAnalysis();
   });
@@ -754,10 +1066,7 @@ video.addEventListener("play", () => {
 });
 video.addEventListener("pause", () => {
   playButton.textContent = "Play";
-  if (videoFrameCallback !== undefined && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(videoFrameCallback);
-  if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
-  videoFrameCallback = undefined;
-  animationFrame = undefined;
+  cancelScheduledAnalysis();
 });
 backButton.addEventListener("click", () => seekBy(-10));
 forwardButton.addEventListener("click", () => seekBy(10));
@@ -766,9 +1075,24 @@ muteButton.addEventListener("click", () => {
   muteButton.textContent = video.muted ? "Muted" : "Sound on";
 });
 backendSelect.addEventListener("change", () => void configureScopes(backendSelect.value));
+rendererSelect.addEventListener("change", () => void selectRenderer(rendererSelect.value));
+qualityProfileSelect.addEventListener("change", () => {
+  const profile = qualityProfile.select(qualityProfileSelect.value);
+  probeResolutionSelect.value = String(profile.inputResolutionScaling);
+  framePacer.setMaxRefreshRate(profile.maxRefreshRate);
+  framePacer.reset();
+  resetDemoMeasurements();
+  scheduleScopeResize();
+  if (profile.name === "mobile") {
+    setStatus("Mobile profile selected · 25% sampling per axis and reduced scope detail; 256 waveform bins merge distinct 10-bit levels. Video playback quality is unchanged.");
+  } else {
+    setStatus("Standard profile selected · native probe and standard scope detail.");
+  }
+  scheduleRegionRefresh();
+});
 probeResolutionSelect.addEventListener("change", () => {
-  probeResolution = Number(probeResolutionSelect.value);
-  setStatus(`${probeResolutionLabel()} selected; playback quality stays adaptive.`);
+  const profile = qualityProfile.setProbeScale(Number(probeResolutionSelect.value));
+  setStatus(`${profile.label} profile · ${probeResolutionLabel()} selected; playback quality stays adaptive.`);
   scheduleRegionRefresh();
 });
 matrixSelect.addEventListener("change", () => {
@@ -817,11 +1141,12 @@ video.addEventListener("loadedmetadata", () => {
 });
 video.addEventListener("loadeddata", () => {
   if (activeSlate) return;
-  if (roiRefresh.pending) roiRefresh.resume();
-  else analyzeCurrentFrame();
+  if (scopeOwnerIsHidden()) roiRefresh.suspend();
+  else if (roiRefresh.pending) roiRefresh.resume();
+  else scheduleRegionRefresh();
   scheduleAnalysis();
 });
-video.addEventListener("seeked", () => analyzeCurrentFrame());
+video.addEventListener("seeked", () => analyzeCurrentFrame(video.currentTime, video.currentTime, true));
 video.addEventListener("timeupdate", () => {
   updatePlaybackControls();
 });
@@ -836,18 +1161,29 @@ window.addEventListener("resize", drawRegion);
 window.addEventListener("pagehide", () => {
   pageIsClosing = true;
   scopeGeneration += 1;
+  rendererGeneration += 1;
   streamGeneration += 1;
-  if (videoFrameCallback !== undefined && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(videoFrameCallback);
-  if (animationFrame !== undefined) cancelAnimationFrame(animationFrame);
+  cancelScheduledAnalysis();
   roiRefresh.destroy();
-  videoFrameCallback = undefined;
-  animationFrame = undefined;
+  scopeResizeObserver?.disconnect();
+  scopeResizeObserver = undefined;
+  if (scopeResizeFallbackWindow) {
+    scopeResizeFallbackWindow.removeEventListener("resize", scheduleScopeResize);
+    scopeResizeFallbackWindow = undefined;
+  }
+  cancelScopeResizeFrame();
+  observedScopeDocument?.removeEventListener("visibilitychange", handleScopeVisibilityChange);
+  observedScopeDocument = undefined;
   closePopout();
   releaseCurrentSource();
   scopes?.destroy();
+  const display = scopeDisplay;
+  scopeDisplay = undefined;
+  void display?.destroy();
 });
 
 updateColorLegend();
 drawRegion();
+syncScopeOwner();
 await configureScopes(backend);
 await loadStream();

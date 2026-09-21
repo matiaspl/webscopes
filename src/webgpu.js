@@ -1,4 +1,5 @@
 import { getColorMatrix, getSourceSize, normalizeAnalysisOptions } from "./analyze.js";
+import { createWebGpuScopeRenderer } from "./webgpu-render.js";
 
 const COMPUTE_SHADER = /* wgsl */ `
 struct Params {
@@ -463,4 +464,540 @@ export async function createWebGpuAnalyzer(options = {}) {
     releaseResources();
     throw error;
   }
+}
+
+function displayNow() {
+  return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function displayChannelNames(mode) {
+  return mode === "luma" ? ["Y"]
+    : mode === "ycbcr-parade" ? ["Y", "Cb", "Cr"]
+      : mode === "composite" ? ["Composite"] : ["R", "G", "B"];
+}
+
+function isVideoSource(source) {
+  return (typeof globalThis.VideoFrame === "function" && source instanceof globalThis.VideoFrame)
+    || source?.nodeName === "VIDEO"
+    || source?.tagName === "VIDEO"
+    || (Number.isFinite(source?.videoWidth) && Number.isFinite(source?.videoHeight));
+}
+
+function isSafariDisplay() {
+  const userAgent = globalThis.navigator?.userAgent ?? "";
+  return /Safari\//.test(userAgent) && !/(?:Chrome|Chromium|CriOS|Edg|OPR|Opera|FxiOS|Firefox)/i.test(userAgent);
+}
+
+/** Create an opt-in WebGPU display which keeps histograms on the GPU between snapshots. */
+export async function createScopeDisplay(options = {}) {
+  const canvas = options.canvas;
+  if (!canvas || typeof canvas.getContext !== "function") throw new TypeError("createScopeDisplay requires an HTML canvas");
+  let context;
+  try { context = canvas.getContext("webgpu"); } catch (error) {
+    throw new Error(`Could not acquire a fresh WebGPU canvas context: ${error.message}`);
+  }
+  if (!context) throw new Error("createScopeDisplay requires a fresh canvas without a previously acquired 2D context");
+
+  let device = options.device;
+  let ownsDevice = false;
+  let format;
+  let pipeline;
+  let renderer;
+  let destroyed = false;
+  let resourcesReleased = false;
+  let lossState;
+  let lostPromise;
+  let externalPipeline;
+  let pendingRequest;
+  let pumpRunning = false;
+  let frameId = 0;
+  let submittedFrames = 0;
+  let queueCompletedFrames = 0;
+  let latestFrame;
+  let destroyPromise;
+  let resolveDestroy;
+  const slots = [makeSlot(), makeSlot()];
+  const completionTasks = new Set();
+  const snapshotTasks = new Set();
+  const commandTasks = new Set();
+  const useExternalVideoTextures = options.videoTextureMode === "external"
+    || (options.videoTextureMode !== "copy" && !isSafariDisplay());
+
+  function makeSlot() {
+    return {
+      binsBuffer: undefined,
+      computeParamsBuffer: undefined,
+      renderParamsBuffer: undefined,
+      bufferSize: 0,
+      texture: undefined,
+      textureView: undefined,
+      textureWidth: 0,
+      textureHeight: 0,
+      busy: false,
+      outstanding: false,
+      snapshotRefs: 0,
+      frame: undefined,
+    };
+  }
+
+  async function withValidationScope(operation) {
+    let scopeOpen = false;
+    try {
+      device.pushErrorScope("validation");
+      scopeOpen = true;
+      const value = operation();
+      const error = await device.popErrorScope();
+      scopeOpen = false;
+      if (error) throw new Error(`WebGPU validation failed: ${error.message}`);
+      return value;
+    } catch (error) {
+      if (scopeOpen) {
+        try { await device.popErrorScope(); } catch {}
+      }
+      throw error;
+    }
+  }
+
+  function throwIfUnavailable() {
+    if (destroyed) throw new Error("Scope display has been destroyed");
+    if (lossState) {
+      const detail = lossState.info?.message ?? lossState.error?.message ?? "device was lost";
+      throw new Error(`WebGPU device lost: ${detail}`);
+    }
+  }
+
+  function emitDeviceLoss(state) {
+    if (lossState) return;
+    lossState = state;
+    const detail = state.info?.message ?? state.error?.message ?? "device was lost";
+    try { options.onDeviceLost?.(new Error(`WebGPU device lost: ${detail}`)); } catch {}
+    if (pendingRequest) {
+      pendingRequest.reject(new Error(`WebGPU device lost: ${detail}`));
+      pendingRequest = undefined;
+    }
+    void pump();
+    maybeRelease();
+  }
+
+  function releaseResources() {
+    if (resourcesReleased) return;
+    resourcesReleased = true;
+    try { renderer?.destroy(); } catch {}
+    for (const slot of slots) {
+      for (const resource of [slot.texture, slot.binsBuffer, slot.computeParamsBuffer, slot.renderParamsBuffer]) {
+        try { resource?.destroy(); } catch {}
+      }
+    }
+    try { context.unconfigure?.(); } catch {}
+    if (ownsDevice) {
+      try { device?.destroy(); } catch {}
+    }
+  }
+
+  function maybeRelease() {
+    if (!destroyed || pumpRunning || commandTasks.size || completionTasks.size || snapshotTasks.size) return;
+    releaseResources();
+    resolveDestroy?.();
+    resolveDestroy = undefined;
+  }
+
+  function validLimits(width, height, config, byteLength, externalVideo, renderOptions) {
+    const limits = device.limits ?? {};
+    const max = (name) => Number.isFinite(limits[name]) ? limits[name] : Number.POSITIVE_INFINITY;
+    const pixelRatio = renderOptions.devicePixelRatio ?? 1;
+    const outputWidth = renderOptions.width && renderOptions.height
+      ? Math.round(renderOptions.width * pixelRatio) : canvas.width;
+    const outputHeight = renderOptions.width && renderOptions.height
+      ? Math.round(renderOptions.height * pixelRatio) : canvas.height;
+    if (width > max("maxTextureDimension2D") || height > max("maxTextureDimension2D")
+      || outputWidth > max("maxTextureDimension2D") || outputHeight > max("maxTextureDimension2D")) {
+      throw new RangeError(`Frame exceeds the GPU texture limit (${max("maxTextureDimension2D")}px)`);
+    }
+    if (Math.ceil(config.sampleWidth / 8) > max("maxComputeWorkgroupsPerDimension")
+      || Math.ceil(config.sampleHeight / 8) > max("maxComputeWorkgroupsPerDimension")) {
+      throw new RangeError("Frame exceeds the GPU dispatch limit");
+    }
+    if (max("maxComputeWorkgroupSizeX") < 8 || max("maxComputeWorkgroupSizeY") < 8
+      || max("maxComputeInvocationsPerWorkgroup") < 64) {
+      throw new RangeError("GPU device does not support the required 8 × 8 compute workgroup");
+    }
+    if (byteLength > max("maxBufferSize") || byteLength > max("maxStorageBufferBindingSize")) {
+      throw new RangeError("Histogram buffers exceed the GPU device limits");
+    }
+    if (128 > max("maxBufferSize") || 128 > max("maxUniformBufferBindingSize")) {
+      throw new RangeError("GPU device cannot allocate the display parameter buffers");
+    }
+    if (max("maxBindingsPerBindGroup") < 4 || max("maxStorageBuffersPerShaderStage") < 1
+      || max("maxUniformBuffersPerShaderStage") < 1
+      || max("maxSampledTexturesPerShaderStage") < (externalVideo ? 4 : 2)
+      || (externalVideo && max("maxSamplersPerShaderStage") < 1)) {
+      throw new RangeError("GPU device limits do not support external video textures in the histogram shader");
+    }
+  }
+
+  function ensureSlotBuffers(slot, byteLength) {
+    if (slot.bufferSize === byteLength) return;
+    const nextBins = device.createBuffer({
+      label: "webscopes direct display histograms",
+      size: byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    let nextComputeParams;
+    let nextRenderParams;
+    try {
+      nextComputeParams = device.createBuffer({
+        label: "webscopes direct display analysis parameters",
+        size: 64,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      nextRenderParams = device.createBuffer({
+        label: "webscopes direct display render parameters",
+        size: 128,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+    } catch (error) {
+      for (const resource of [nextBins, nextComputeParams, nextRenderParams]) {
+        try { resource?.destroy(); } catch {}
+      }
+      throw error;
+    }
+    for (const resource of [slot.binsBuffer, slot.computeParamsBuffer, slot.renderParamsBuffer]) {
+      try { resource?.destroy(); } catch {}
+    }
+    slot.binsBuffer = nextBins;
+    slot.computeParamsBuffer = nextComputeParams;
+    slot.renderParamsBuffer = nextRenderParams;
+    slot.bufferSize = byteLength;
+  }
+
+  function ensureSlotTexture(slot, width, height) {
+    if (slot.textureWidth === width && slot.textureHeight === height) return;
+    slot.texture?.destroy();
+    slot.texture = device.createTexture({
+      label: "webscopes direct display source frame",
+      size: { width, height },
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    slot.textureView = slot.texture.createView();
+    slot.textureWidth = width;
+    slot.textureHeight = height;
+  }
+
+  async function getExternalPipeline() {
+    if (externalPipeline) return externalPipeline;
+    const created = await withValidationScope(() => {
+      const shader = device.createShaderModule({ code: EXTERNAL_COMPUTE_SHADER, label: "webscopes display external-video compute" });
+      return device.createComputePipeline({ layout: "auto", compute: { module: shader, entryPoint: "main" } });
+    });
+    externalPipeline = created;
+    return created;
+  }
+
+  function availableSlot() {
+    return slots.find((slot) => !slot.busy && !slot.outstanding && slot.snapshotRefs === 0 && slot !== latestFrame?.slot);
+  }
+
+  function trackQueueCompletion(slot, completedFrameId) {
+    slot.outstanding = true;
+    let queueWork;
+    try {
+      queueWork = device.queue.onSubmittedWorkDone?.();
+    } catch (error) {
+      queueWork = Promise.reject(error);
+    }
+    const lostWork = lostPromise.then(() => { throwIfUnavailable(); });
+    const completion = Promise.race([Promise.resolve(queueWork), lostWork]).then(() => {
+      slot.outstanding = false;
+      if (completedFrameId === undefined) return;
+      queueCompletedFrames = Math.max(queueCompletedFrames, completedFrameId);
+      try { options.onQueueCompleted?.({ frameId: completedFrameId, submittedFrames, queueCompletedFrames }); } catch {}
+    }, (error) => {
+      slot.outstanding = false;
+      if (lossState) emitDeviceLoss(lossState);
+      else {
+        try { options.onError?.(error); } catch {}
+      }
+    }).finally(() => {
+      completionTasks.delete(completion);
+      void pump();
+      maybeRelease();
+    });
+    completionTasks.add(completion);
+    return completion;
+  }
+
+  function buildFrameMetadata(sourceWidth, sourceHeight, config, frameNumber) {
+    const channelCount = config.waveformMode === "luma" || config.waveformMode === "composite" ? 1 : 3;
+    const metadata = {
+      frameId: frameNumber,
+      width: sourceWidth,
+      height: sourceHeight,
+      sampleCount: config.sampleWidth * config.sampleHeight,
+      waveform: {
+        width: config.waveformWidth,
+        height: config.waveformHeight,
+        bitDepth: config.bitDepth,
+        mode: config.waveformMode,
+        channelNames: displayChannelNames(config.waveformMode),
+        channelCount,
+      },
+      vectorscope: { width: config.vectorscopeSize, height: config.vectorscopeSize, colorMatrix: config.colorMatrix },
+      stats: { colorMatrix: config.colorMatrix, bitDepth: config.bitDepth },
+    };
+    return metadata;
+  }
+
+  async function submitRequest(slot, request) {
+    throwIfUnavailable();
+    const { source, analysisOptions, resolve, reject } = request;
+    const startedAt = displayNow();
+    let queueSubmitted = false;
+    try {
+      if (source && typeof source === "object" && "data" in source) {
+        throw new TypeError("ScopeDisplay accepts decoded browser image/video sources; use createScopes for raw pixel frames");
+      }
+      const { width, height } = getSourceSize(source);
+      const merged = { ...options, ...analysisOptions };
+      const config = normalizeAnalysisOptions(width, height, { ...merged, bitDepth: merged.bitDepth ?? 8 });
+      const channelCount = config.waveformMode === "luma" || config.waveformMode === "composite" ? 1 : 3;
+      const vectorArea = config.vectorscopeSize * config.vectorscopeSize;
+      const channelArea = config.waveformWidth * config.waveformHeight;
+      const binCount = vectorArea + channelArea * channelCount;
+      const byteLength = binCount * Uint32Array.BYTES_PER_ELEMENT;
+      const externalVideo = useExternalVideoTextures && isVideoSource(source);
+      const renderOptions = { ...options.renderOptions, ...analysisOptions.renderOptions };
+      validLimits(width, height, config, byteLength, externalVideo, renderOptions);
+      if (externalVideo && typeof device.importExternalTexture !== "function") {
+        throw new Error("This WebGPU device does not support external video textures");
+      }
+      ensureSlotBuffers(slot, byteLength);
+      if (!externalVideo) ensureSlotTexture(slot, width, height);
+
+      const matrix = getColorMatrix(config.colorMatrix);
+      const computeParams = new ArrayBuffer(64);
+      const computeView = new DataView(computeParams);
+      const words = [width, height, config.waveformWidth, config.waveformHeight, gpuMode(config.waveformMode), config.x0, config.y0, config.cropWidth,
+        config.cropHeight, config.vectorscopeSize, config.sampleWidth, config.sampleHeight];
+      words.forEach((word, index) => computeView.setUint32(index * 4, word, true));
+      computeView.setUint32(48, matrix.krFixed, true);
+      computeView.setUint32(52, matrix.kbFixed, true);
+      computeView.setUint32(56, 1024, true);
+      const activePipeline = externalVideo ? await getExternalPipeline() : pipeline;
+      await withValidationScope(() => {
+        let sourceResource;
+        if (externalVideo) {
+          sourceResource = device.importExternalTexture({ source, colorSpace: "srgb" });
+        } else {
+          device.queue.copyExternalImageToTexture(
+            { source },
+            { texture: slot.texture, colorSpace: "srgb", premultipliedAlpha: false },
+            { width, height },
+          );
+          sourceResource = slot.textureView;
+        }
+        device.queue.writeBuffer(slot.computeParamsBuffer, 0, computeParams);
+        const computeBindGroup = device.createBindGroup({
+          layout: activePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: sourceResource },
+            { binding: 1, resource: { buffer: slot.binsBuffer } },
+            { binding: 2, resource: { buffer: slot.computeParamsBuffer } },
+          ],
+        });
+        const resultMetadata = buildFrameMetadata(width, height, config, frameId + 1);
+        const encoder = device.createCommandEncoder({ label: "webscopes direct display frame" });
+        encoder.clearBuffer(slot.binsBuffer);
+        const computePass = encoder.beginComputePass({ label: "webscopes histogram computation" });
+        computePass.setPipeline(activePipeline);
+        computePass.setBindGroup(0, computeBindGroup);
+        computePass.dispatchWorkgroups(Math.ceil(config.sampleWidth / 8), Math.ceil(config.sampleHeight / 8));
+        computePass.end();
+        renderer.encode(encoder, { binsBuffer: slot.binsBuffer, renderParamsBuffer: slot.renderParamsBuffer, result: resultMetadata, renderOptions });
+        device.queue.submit([encoder.finish()]);
+        queueSubmitted = true;
+      });
+      throwIfUnavailable();
+      const id = ++frameId;
+      const metadata = buildFrameMetadata(width, height, config, id);
+      slot.frame = { metadata, vectorArea, channelArea, channelCount, byteLength, frameId: id };
+      slot.outstanding = true;
+      slot.busy = false;
+      submittedFrames += 1;
+      latestFrame = { slot, ...slot.frame };
+      const submissionTimeMs = Math.max(0, displayNow() - startedAt);
+      trackQueueCompletion(slot, id);
+      resolve({
+        status: "submitted",
+        frameId: id,
+        submittedFrames,
+        queueCompletedFrames,
+        metadata,
+        submissionTimeMs,
+      });
+    } catch (error) {
+      slot.busy = false;
+      // queue.submit can precede an asynchronous validation-scope or device
+      // loss error. Keep this slot and its buffers alive until queued work has
+      // drained even when the request itself rejects.
+      if (queueSubmitted) trackQueueCompletion(slot, undefined);
+      reject(error);
+    }
+  }
+
+  async function pump() {
+    if (pumpRunning) return;
+    pumpRunning = true;
+    try {
+      while (!destroyed && pendingRequest) {
+        const slot = availableSlot();
+        if (!slot) break;
+        const request = pendingRequest;
+        pendingRequest = undefined;
+        slot.busy = true;
+        const task = submitRequest(slot, request);
+        commandTasks.add(task);
+        void task.finally(() => {
+          commandTasks.delete(task);
+          maybeRelease();
+        });
+        await task;
+      }
+    } finally {
+      pumpRunning = false;
+      maybeRelease();
+      if (!destroyed && pendingRequest && availableSlot()) void pump();
+    }
+  }
+
+  try {
+    if (!device) {
+      let adapter = options.adapter;
+      if (!adapter) {
+        const gpu = options.gpu ?? globalThis.navigator?.gpu;
+        if (!gpu) throw new Error("WebGPU is not available in this browser");
+        adapter = await gpu.requestAdapter(options.adapterOptions);
+      }
+      if (!adapter) throw new Error("No WebGPU adapter is available");
+      device = await adapter.requestDevice();
+      ownsDevice = true;
+    }
+    lostPromise = device.lost && typeof device.lost.then === "function"
+      ? device.lost.then((info) => { emitDeviceLoss({ info }); return { info }; }, (error) => { emitDeviceLoss({ error }); return { error }; })
+      : new Promise(() => {});
+    format = options.format ?? (options.gpu ?? globalThis.navigator?.gpu)?.getPreferredCanvasFormat?.() ?? "bgra8unorm";
+    context.configure({
+      device,
+      format,
+      alphaMode: "opaque",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+    });
+    const compute = await withValidationScope(() => {
+      const shader = device.createShaderModule({ code: COMPUTE_SHADER, label: "webscopes shared histogram compute" });
+      return device.createComputePipeline({ layout: "auto", compute: { module: shader, entryPoint: "main" } });
+    });
+    pipeline = compute;
+    renderer = await withValidationScope(() => createWebGpuScopeRenderer({ device, canvas, context, format }));
+    throwIfUnavailable();
+  } catch (error) {
+    destroyed = true;
+    releaseResources();
+    throw error;
+  }
+
+  return {
+    get submittedFrames() { return submittedFrames; },
+    /** Number of submitted frame queues completed by WebGPU; this is not compositor presentation. */
+    get queueCompletedFrames() { return queueCompletedFrames; },
+    get canvas() { return canvas; },
+    present(source, analysisOptions = {}) {
+      if (destroyed) return Promise.reject(new Error("Scope display has been destroyed"));
+      if (lossState) return Promise.reject(new Error(`WebGPU device lost: ${lossState.info?.message ?? lossState.error?.message ?? "device was lost"}`));
+      return new Promise((resolve, reject) => {
+        if (pendingRequest) pendingRequest.resolve({ status: "superseded" });
+        pendingRequest = { source, analysisOptions, resolve, reject };
+        void pump();
+      });
+    },
+    async snapshot() {
+      if (destroyed) throw new Error("Scope display has been destroyed");
+      throwIfUnavailable();
+      const frame = latestFrame;
+      if (!frame) throw new Error("No frame has been submitted yet");
+      const slot = frame.slot;
+      slot.snapshotRefs += 1;
+      const task = (async () => {
+        let staging;
+        let mapped = false;
+        try {
+          throwIfUnavailable();
+          staging = device.createBuffer({
+            label: `webscopes snapshot frame ${frame.frameId}`,
+            size: frame.byteLength,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+          });
+          const encoder = device.createCommandEncoder({ label: `webscopes histogram snapshot frame ${frame.frameId}` });
+          encoder.copyBufferToBuffer(slot.binsBuffer, 0, staging, 0, frame.byteLength);
+          device.queue.submit([encoder.finish()]);
+          const mapPromise = staging.mapAsync(GPUMapMode.READ);
+          void mapPromise.catch(() => {});
+          await Promise.race([mapPromise, lostPromise.then(() => { throwIfUnavailable(); })]);
+          mapped = true;
+          throwIfUnavailable();
+          const allBins = new Uint32Array(staging.getMappedRange()).slice();
+          const channels = Array.from({ length: frame.channelCount }, (_, index) => new Uint32Array(allBins.subarray(
+            frame.vectorArea + index * frame.channelArea,
+            frame.vectorArea + (index + 1) * frame.channelArea,
+          )));
+          const vectorscopeBins = new Uint32Array(allBins.subarray(0, frame.vectorArea));
+          return {
+            width: frame.metadata.width,
+            height: frame.metadata.height,
+            sampleCount: frame.metadata.sampleCount,
+            waveform: {
+              width: frame.metadata.waveform.width,
+              height: frame.metadata.waveform.height,
+              bitDepth: frame.metadata.waveform.bitDepth,
+              mode: frame.metadata.waveform.mode,
+              channelNames: [...frame.metadata.waveform.channelNames],
+              channels,
+            },
+            vectorscope: {
+              width: frame.metadata.vectorscope.width,
+              height: frame.metadata.vectorscope.height,
+              bins: vectorscopeBins,
+              colorMatrix: frame.metadata.vectorscope.colorMatrix,
+            },
+            stats: { ...frame.metadata.stats },
+          };
+        } finally {
+          if (mapped) {
+            try { staging.unmap(); } catch {}
+          }
+          try { staging?.destroy(); } catch {}
+          slot.snapshotRefs -= 1;
+          void pump();
+          maybeRelease();
+        }
+      })();
+      snapshotTasks.add(task);
+      try { return await task; }
+      finally {
+        snapshotTasks.delete(task);
+        maybeRelease();
+      }
+    },
+    destroy() {
+      if (!destroyed) {
+        destroyed = true;
+        if (pendingRequest) {
+          pendingRequest.reject(new Error("Scope display has been destroyed"));
+          pendingRequest = undefined;
+        }
+      }
+      if (!destroyPromise) destroyPromise = new Promise((resolve) => { resolveDestroy = resolve; });
+      maybeRelease();
+      return destroyPromise;
+    },
+  };
 }

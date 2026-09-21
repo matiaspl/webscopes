@@ -10,10 +10,11 @@
     h1 { font: 600 22px/1.2 system-ui, sans-serif; }
     #status { padding: 14px; border: 1px solid #273949; border-radius: 8px; white-space: pre-wrap; }
     .views { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+    .direct-views { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
     figure { min-width: 0; margin: 0; }
     figcaption { margin: 0 0 8px; font: 600 13px system-ui, sans-serif; }
     canvas { display: block; width: 100%; height: auto; border: 1px solid #273949; border-radius: 6px; }
-    @media(max-width: 760px) { .views { grid-template-columns: 1fr; } }
+    @media(max-width: 760px) { .views, .direct-views { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -22,6 +23,10 @@
   <div class="views">
     <figure><figcaption>CPU analysis · display dither 0</figcaption><canvas id="cpu" width="960" height="540"></canvas></figure>
     <figure><figcaption>WebGPU analysis · display dither 0</figcaption><canvas id="gpu" width="960" height="540"></canvas></figure>
+  </div>
+  <div class="direct-views">
+    <figure><figcaption>Canvas2D reference · direct-render fixture</figcaption><canvas id="direct-reference" width="640" height="360"></canvas></figure>
+    <figure><figcaption>WebGPU direct display</figcaption><canvas id="direct" width="640" height="360"></canvas></figure>
   </div>
   <script type="module" src="./browser-gpu-check.js"></script>
 </body>

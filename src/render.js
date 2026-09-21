@@ -226,7 +226,10 @@ function drawWaveformImage(context, waveform, x, y, width, height, gain, antiali
     }
   }
   context.putImageData(image, x, y);
+}
 
+function drawWaveformAnnotations(context, waveform, x, y, width, height, dpr) {
+  const mode = waveform.mode;
   context.save();
   context.strokeStyle = COLORS.grid;
   context.lineWidth = Math.max(1, dpr);
@@ -347,7 +350,19 @@ function drawVectorscope(context, vectorscope, x, y, width, height, gain, dither
     }
   }
   context.putImageData(image, left, top);
+}
 
+function drawVectorscopeAnnotations(context, vectorscope, x, y, width, height, dpr) {
+  const size = Math.min(width, height);
+  const left = x + Math.floor((width - size) / 2);
+  const top = y + Math.floor((height - size) / 2);
+  const { width: binsWidth } = vectorscope;
+  const matrix = vectorscope.colorMatrix === "bt601" ? [0.299, 0.114]
+    : vectorscope.colorMatrix === "bt2020" || vectorscope.colorMatrix === "bt2100" ? [0.2627, 0.0593] : [0.2126, 0.0722];
+  const [kr, kb] = matrix;
+  const kg = 1 - kr - kb;
+  const center = (size - 1) / 2;
+  const radius = size * 0.44;
   const centerX = left + center;
   const centerY = top + center;
   context.save();
@@ -397,6 +412,100 @@ function drawVectorscope(context, vectorscope, x, y, width, height, gain, dither
   context.restore();
 }
 
+function scopeLayout(width, height, options = {}) {
+  const dpr = options.devicePixelRatio ?? globalThis.devicePixelRatio ?? 1;
+  const gap = Math.max(0, Math.round((options.gap ?? 10) * dpr));
+  const inset = Math.max(0, Math.round((options.inset ?? 16) * dpr));
+  const layout = options.layout ?? "side-by-side";
+  let waveformRect;
+  let vectorRect;
+  let vectorHeadingY;
+  if (layout === "stacked") {
+    const chartHeight = Math.floor((height - inset * 2 - gap) / 2);
+    waveformRect = { x: inset, y: inset + 22 * dpr, width: width - inset * 2, height: chartHeight - 22 * dpr };
+    vectorRect = { x: inset, y: inset + chartHeight + gap + 22 * dpr, width: width - inset * 2, height: chartHeight - 22 * dpr };
+    vectorHeadingY = inset + chartHeight + gap;
+  } else {
+    const chartWidth = Math.floor((width - inset * 2 - gap) * 0.58);
+    waveformRect = { x: inset, y: inset + 22 * dpr, width: chartWidth, height: height - inset * 2 - 22 * dpr };
+    vectorRect = { x: inset + chartWidth + gap, y: inset + 22 * dpr, width: width - inset * 2 - chartWidth - gap, height: height - inset * 2 - 22 * dpr };
+    vectorHeadingY = inset;
+  }
+  return { dpr, gap, inset, waveformRect, vectorRect, vectorHeadingY };
+}
+
+export function getScopeRenderGeometry(width, height, options = {}) {
+  return scopeLayout(width, height, options);
+}
+
+function drawScopeAnnotations(result, context, width, height, options = {}) {
+  const { dpr, inset, waveformRect, vectorRect, vectorHeadingY } = scopeLayout(width, height, options);
+  context.fillStyle = options.textColor ?? COLORS.text;
+  context.font = `${Math.max(10, Math.round(12 * dpr))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  context.textBaseline = "top";
+  context.fillText("WAVEFORM", waveformRect.x, inset);
+  context.fillText("VECTORSCOPE", vectorRect.x, vectorHeadingY);
+  drawWaveformAnnotations(
+    context,
+    result.waveform,
+    waveformRect.x,
+    waveformRect.y,
+    Math.max(1, Math.floor(waveformRect.width)),
+    Math.max(1, Math.floor(waveformRect.height)),
+    dpr,
+  );
+  drawVectorscopeAnnotations(
+    context,
+    result.vectorscope,
+    vectorRect.x,
+    vectorRect.y,
+    Math.max(1, Math.floor(vectorRect.width)),
+    Math.max(1, Math.floor(vectorRect.height)),
+    dpr,
+  );
+  const performance = result.stats?.performance;
+  if ((options.showPerformance ?? true) && performance) {
+    const fps = performance.averageFps ?? performance.fps;
+    const frameTimeMs = performance.frameTimeMs;
+    const backend = performance.backend ? `${performance.backend.toUpperCase()} ` : "";
+    context.save();
+    context.textAlign = "right";
+    context.textBaseline = "middle";
+    context.fillStyle = options.performanceColor ?? "#d9e7f0";
+    context.font = `${Math.max(10, Math.round(11 * dpr))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+    context.fillText(
+      `${backend}process est ${fps.toFixed(1)} FPS · ${frameTimeMs.toFixed(1)} ms`,
+      width - inset,
+      height - inset / 2,
+      Math.max(80, width - inset * 2),
+    );
+    context.restore();
+  }
+  return { ...scopeLayout(width, height, options), waveformRect, vectorRect };
+}
+
+/** Draw the cached transparent labels and graticules used by a direct renderer. */
+export function renderScopesOverlay(result, canvasOrContext, options = {}) {
+  const context = typeof canvasOrContext?.getContext === "function"
+    ? canvasOrContext.getContext("2d")
+    : canvasOrContext;
+  if (!context || typeof context.clearRect !== "function") throw new TypeError("renderScopesOverlay needs a 2D canvas context");
+  const canvas = context.canvas;
+  const dpr = options.devicePixelRatio ?? globalThis.devicePixelRatio ?? 1;
+  if (options.width && options.height && canvas && (canvas.width !== Math.round(options.width * dpr) || canvas.height !== Math.round(options.height * dpr))) {
+    canvas.width = Math.round(options.width * dpr);
+    canvas.height = Math.round(options.height * dpr);
+  }
+  const width = canvas?.width ?? options.pixelWidth;
+  const height = canvas?.height ?? options.pixelHeight;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2) {
+    throw new TypeError("Overlay needs a positive drawing-buffer size");
+  }
+  context.clearRect(0, 0, width, height);
+  drawScopeAnnotations(result, context, width, height, options);
+  return result;
+}
+
 /** Draw both scopes into a supplied 2D canvas context. */
 export function renderScopes(result, canvasOrContext, options = {}) {
   const context = typeof canvasOrContext?.getContext === "function"
@@ -414,29 +523,9 @@ export function renderScopes(result, canvasOrContext, options = {}) {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 2 || height < 2) {
     throw new TypeError("Canvas needs a positive drawing-buffer size");
   }
-  const gap = Math.max(0, Math.round((options.gap ?? 10) * dpr));
-  const inset = Math.max(0, Math.round((options.inset ?? 16) * dpr));
+  const { inset, waveformRect, vectorRect } = scopeLayout(width, height, options);
   context.fillStyle = options.background ?? COLORS.background;
   context.fillRect(0, 0, width, height);
-  context.fillStyle = options.textColor ?? COLORS.text;
-  context.font = `${Math.max(10, Math.round(12 * dpr))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-  context.textBaseline = "top";
-  const layout = options.layout ?? "side-by-side";
-  let waveformRect;
-  let vectorRect;
-  if (layout === "stacked") {
-    const chartHeight = Math.floor((height - inset * 2 - gap) / 2);
-    waveformRect = { x: inset, y: inset + 22 * dpr, width: width - inset * 2, height: chartHeight - 22 * dpr };
-    vectorRect = { x: inset, y: inset + chartHeight + gap + 22 * dpr, width: width - inset * 2, height: chartHeight - 22 * dpr };
-    context.fillText("WAVEFORM", inset, inset);
-    context.fillText("VECTORSCOPE", inset, inset + chartHeight + gap);
-  } else {
-    const chartWidth = Math.floor((width - inset * 2 - gap) * 0.58);
-    waveformRect = { x: inset, y: inset + 22 * dpr, width: chartWidth, height: height - inset * 2 - 22 * dpr };
-    vectorRect = { x: inset + chartWidth + gap, y: inset + 22 * dpr, width: width - inset * 2 - chartWidth - gap, height: height - inset * 2 - 22 * dpr };
-    context.fillText("WAVEFORM", waveformRect.x, inset);
-    context.fillText("VECTORSCOPE", vectorRect.x, inset);
-  }
   const gain = options.gain ?? 0.18;
   const dither = options.dither === undefined
     ? 0
@@ -457,23 +546,6 @@ export function renderScopes(result, canvasOrContext, options = {}) {
     dpr,
   );
   drawVectorscope(context, result.vectorscope, vectorRect.x, vectorRect.y, Math.max(1, Math.floor(vectorRect.width)), Math.max(1, Math.floor(vectorRect.height)), gain, vectorscopeDither, dpr);
-  const performance = result.stats?.performance;
-  if ((options.showPerformance ?? true) && performance) {
-    const fps = performance.averageFps ?? performance.fps;
-    const frameTimeMs = performance.frameTimeMs;
-    const backend = performance.backend ? `${performance.backend.toUpperCase()} ` : "";
-    context.save();
-    context.textAlign = "right";
-    context.textBaseline = "middle";
-    context.fillStyle = options.performanceColor ?? "#d9e7f0";
-    context.font = `${Math.max(10, Math.round(11 * dpr))}px ui-monospace, SFMono-Regular, Menlo, monospace`;
-    context.fillText(
-      `${backend}avg ${fps.toFixed(1)} FPS · last ${frameTimeMs.toFixed(1)} ms`,
-      width - inset,
-      height - inset / 2,
-      Math.max(80, width - inset * 2),
-    );
-    context.restore();
-  }
+  drawScopeAnnotations(result, context, width, height, options);
   return result;
 }

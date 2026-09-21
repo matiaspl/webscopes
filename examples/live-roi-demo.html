@@ -59,7 +59,7 @@
     #file-input { display: none; }
     .time { min-width: 86px; color: #aebaca; text-align: right; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
     .scope-wrap { padding: 12px; }
-    #scope { display: block; width: 100%; height: auto; border-radius: 6px; background: #070a0e; }
+    #scope { display: block; width: 100%; max-width: 100%; height: auto; margin-inline: auto; border-radius: 6px; background: #070a0e; }
     .scope-legend { display: flex; justify-content: space-between; gap: 12px; padding: 0 3px 2px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
     #status { min-height: 37px; margin-top: 13px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 8px; color: #a8b5c3; background: #0d1218; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
     #status[data-kind="error"] { color: #ff9b9b; border-color: #673c42; }
@@ -117,6 +117,11 @@
         <option value="webgpu">WebGPU</option>
         <option value="cpu">CPU</option>
       </select>
+      <label class="control-label" for="renderer">Renderer</label>
+      <select id="renderer" aria-label="Scope display renderer" title="WebGPU direct display is experimental and remains opt-in">
+        <option value="canvas2d" selected>Canvas2D</option>
+        <option value="webgpu">WebGPU direct</option>
+      </select>
       <label class="control-label" for="matrix">Matrix</label>
       <select id="matrix" aria-label="Color matrix override" title="Override the matrix used for YCbCr and vectorscope calculations">
         <option value="">Auto</option>
@@ -138,6 +143,11 @@
         <option value="luma">Luma</option>
         <option value="ycbcr-parade">YCbCr parade</option>
         <option value="composite">Composite</option>
+      </select>
+      <label class="control-label" for="quality-profile">Profile</label>
+      <select id="quality-profile" aria-label="Scope quality profile" title="Mobile reduces scope detail to target responsive updates; video playback quality stays unchanged">
+        <option value="standard" selected>Standard</option>
+        <option value="mobile">Mobile</option>
       </select>
       <label class="control-label" for="probe-resolution">Probe</label>
       <select id="probe-resolution" aria-label="Probe resolution" title="Sparse analysis sampling; playback quality stays adaptive">
@@ -202,6 +212,7 @@
       <span><strong>Drag</strong> over the video to set a custom region.</span>
       <span><strong>Click a preset</strong> to compare color from different parts of the frame.</span>
       <span><strong>Probe resolution</strong> keeps playback at its adaptive stream resolution and sparsely samples the decoded frame at 100%, 75%, 50%, or 25% in each dimension.</span>
+      <span><strong>Mobile profile</strong> targets up to 20 scope updates per second with a 480×260 drawing buffer; 256 waveform bins reduce scope detail and merge distinct 10-bit code levels. Standard remains the default.</span>
       <span><strong>Internal slates</strong> generate standards-defined SMPTE RP 219-1, EBU Tech 3373, and ARIB STD-B28 10-bit v210 signals, plus one explicitly custom diagnostic slate; matrix and range changes regenerate the encoded test signal.</span>
       <span><strong>Color overrides</strong> use Auto by default; choose a matrix or range when source metadata is missing or incorrect. Range affects YCbCr inputs; browser RGB frames are already decoded.</span>
       <span>Scopes analyze each distinct presented frame once, then follow the selected ROI.</span>

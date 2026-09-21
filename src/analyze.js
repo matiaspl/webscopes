@@ -122,7 +122,7 @@ export function readFramePixels(frame, reusableCapture) {
  * opaque and Safari has returned non-opaque data for RGBA readback. The
  * destination buffer is safe to reuse because createScopes serializes updates.
  */
-export async function readFramePixelsAsync(frame, reusableCapture = {}) {
+export async function readFramePixelsAsync(frame, reusableCapture = {}, captureOptions = {}) {
   if (isRawPixelFrame(frame)) return frame;
   if (reusableCapture.videoFrameReadback !== false && typeof globalThis.VideoFrame === "function") {
     let videoFrame;
@@ -138,32 +138,85 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
       if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
         throw new TypeError("VideoFrame must expose positive integer display dimensions");
       }
-      const packedByteLength = width * height * 4;
-      if (!Number.isSafeInteger(packedByteLength)) throw new RangeError("VideoFrame dimensions exceed the RGBA readback limit");
+      const hasRegionOptions = captureOptions.region !== undefined
+        || captureOptions.inputRegionX0 !== undefined
+        || captureOptions.inputRegionY0 !== undefined
+        || captureOptions.inputRegionX1 !== undefined
+        || captureOptions.inputRegionY1 !== undefined;
+      const captureConfig = hasRegionOptions
+        ? normalizedOptions(width, height, { ...captureOptions, bitDepth: 8 })
+        : undefined;
+      const wantsRoi = captureConfig && (captureConfig.x0 !== 0 || captureConfig.y0 !== 0
+        || captureConfig.cropWidth !== width || captureConfig.cropHeight !== height);
       const formats = reusableCapture.videoFramePixelFormat === "RGBX"
         ? ["RGBX", "RGBA"]
         : reusableCapture.videoFramePixelFormat === "RGBA"
           ? ["RGBA", "RGBX"]
           : ["RGBX", "RGBA"];
       let lastReadbackError;
+      const copyVideoFrame = async (format, rect, metadata) => {
+        const copyWidth = rect?.width ?? width;
+        const copyHeight = rect?.height ?? height;
+        const copyOptions = { format, colorSpace: "srgb" };
+        if (rect) copyOptions.rect = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        const minimumByteLength = copyWidth * copyHeight * 4;
+        const byteLength = typeof videoFrame.allocationSize === "function"
+          ? videoFrame.allocationSize(copyOptions)
+          : minimumByteLength;
+        if (!Number.isSafeInteger(byteLength) || byteLength < minimumByteLength) {
+          throw new RangeError(`Unexpected ${format} VideoFrame readback size: ${byteLength}`);
+        }
+        if (!(reusableCapture.data instanceof Uint8Array) || reusableCapture.data.byteLength !== byteLength) {
+          reusableCapture.data = new Uint8Array(byteLength);
+        }
+        const layouts = await videoFrame.copyTo(reusableCapture.data, copyOptions);
+        const bytesPerRow = layouts?.[0]?.stride ?? copyWidth * 4;
+        if (!Number.isSafeInteger(bytesPerRow) || bytesPerRow < copyWidth * 4 || bytesPerRow % 4 !== 0
+          || (copyHeight - 1) * bytesPerRow + copyWidth * 4 > byteLength) {
+          throw new RangeError(`Unexpected ${format} VideoFrame row stride: ${bytesPerRow}`);
+        }
+        if (format === "RGBA" && !hasOpaqueRgbaAlpha(reusableCapture.data, copyWidth, copyHeight, bytesPerRow)) {
+          throw new TypeError("VideoFrame RGBA readback is not opaque");
+        }
+        reusableCapture.videoFramePixelFormat = format;
+        return {
+          width: copyWidth,
+          height: copyHeight,
+          data: reusableCapture.data,
+          bytesPerRow,
+          pixelStride: 4,
+          colorMatrix: frame.colorMatrix,
+          colorRange: frame.colorRange,
+          capturedByteLength: byteLength,
+          captureUsedRoi: Boolean(rect),
+          ...metadata,
+        };
+      };
+
+      if (wantsRoi && reusableCapture.videoFrameRoiCapture !== false) {
+        const rect = { x: captureConfig.x0, y: captureConfig.y0, width: captureConfig.cropWidth, height: captureConfig.cropHeight };
+        for (const format of formats) {
+          try {
+            const pixels = await copyVideoFrame(format, rect, {
+              sourceWidth: width,
+              sourceHeight: height,
+              originX: rect.x,
+              originY: rect.y,
+            });
+            reusableCapture.videoFrameRoiCapture = true;
+            return pixels;
+          } catch (error) {
+            lastReadbackError = error;
+          }
+        }
+        // ROI copy is optional. Remember unsupported exact crops and capture
+        // the full frame below, where the analysis core retains the same map.
+        reusableCapture.videoFrameRoiCapture = false;
+      }
+
       for (const format of formats) {
         try {
-          const copyOptions = { format, colorSpace: "srgb" };
-          const byteLength = typeof videoFrame.allocationSize === "function"
-            ? videoFrame.allocationSize(copyOptions)
-            : packedByteLength;
-          if (!Number.isSafeInteger(byteLength) || byteLength !== packedByteLength) {
-            throw new RangeError(`Unexpected ${format} VideoFrame readback size: ${byteLength}`);
-          }
-          if (!(reusableCapture.data instanceof Uint8Array) || reusableCapture.data.byteLength !== byteLength) {
-            reusableCapture.data = new Uint8Array(byteLength);
-          }
-          await videoFrame.copyTo(reusableCapture.data, copyOptions);
-          if (format === "RGBA" && !hasOpaqueRgbaAlpha(reusableCapture.data)) {
-            throw new TypeError("VideoFrame RGBA readback is not opaque");
-          }
-          reusableCapture.videoFramePixelFormat = format;
-          return { width, height, data: reusableCapture.data };
+          return await copyVideoFrame(format, undefined, { sourceWidth: width, sourceHeight: height, originX: 0, originY: 0 });
         } catch (error) {
           lastReadbackError = error;
         }
@@ -182,14 +235,16 @@ export async function readFramePixelsAsync(frame, reusableCapture = {}) {
   return readFramePixels(frame, reusableCapture);
 }
 
-function hasOpaqueRgbaAlpha(data) {
+function hasOpaqueRgbaAlpha(data, width = data.length / 4, height = 1, bytesPerRow = width * 4) {
   // Decoded video frames are opaque. Safari can resolve VideoFrame.copyTo with
   // a buffer that is not actually RGBA; reject it before analysis consumes the
   // malformed bytes and use the canvas fallback instead.
-  const pixelCount = data.length / 4;
+  const pixelCount = width * height;
   const step = Math.max(1, Math.floor(pixelCount / 32));
   for (let pixel = 0; pixel < pixelCount; pixel += step) {
-    if (data[pixel * 4 + 3] !== 255) return false;
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    if (data[y * bytesPerRow + x * 4 + 3] !== 255) return false;
   }
   return true;
 }
@@ -422,7 +477,23 @@ function validateSampledRgb(data, config, rowStride, pixelStride) {
 export function analyzeFrame(frame, options = {}) {
   const startedAt = globalThis.performance?.now?.() ?? Date.now();
   const pixels = readFramePixels(frame);
-  const { width, height, data } = pixels;
+  return analyzeCapturedPixels(pixels, options, { startedAt });
+}
+
+/** Analyze captured pixels while retaining their original-frame coordinate system. */
+export function analyzeCapturedPixels(pixels, options = {}, timing = {}) {
+  const startedAt = timing.startedAt ?? globalThis.performance?.now?.() ?? Date.now();
+  const pixelWidth = pixels.width;
+  const pixelHeight = pixels.height;
+  const width = pixels.sourceWidth ?? pixelWidth;
+  const height = pixels.sourceHeight ?? pixelHeight;
+  const originX = pixels.originX ?? 0;
+  const originY = pixels.originY ?? 0;
+  if (![width, height, pixelWidth, pixelHeight, originX, originY].every(Number.isInteger)
+    || width < 1 || height < 1 || pixelWidth < 1 || pixelHeight < 1 || originX < 0 || originY < 0) {
+    throw new TypeError("Captured pixels must include valid source dimensions and origin coordinates");
+  }
+  const { data } = pixels;
   const inputBitDepth = options.bitDepth ?? pixels.bitDepth ?? (isV210Frame(pixels) ? 10 : undefined);
   if (data instanceof Uint16Array && inputBitDepth === undefined) {
     throw new RangeError("bitDepth is required for Uint16Array pixel data");
@@ -436,10 +507,16 @@ export function analyzeFrame(frame, options = {}) {
   if (isV210Frame(pixels)) return analyzeV210Frame(pixels, config, startedAt);
 
   const { rowStride, pixelStride } = validatePixelLayout(pixels);
+  const localX0 = config.x0 - originX;
+  const localY0 = config.y0 - originY;
+  if (localX0 < 0 || localY0 < 0 || localX0 + config.cropWidth > pixelWidth || localY0 + config.cropHeight > pixelHeight) {
+    throw new RangeError("Captured pixels do not contain the requested analysis region");
+  }
+  const pixelConfig = { ...config, x0: localX0, y0: localY0 };
   if (inputBitDepth > 8 && !(data instanceof Uint16Array) && !(data instanceof Float32Array) && !(data instanceof Float64Array)) {
     throw new TypeError("10-bit and 12-bit integer pixels must use Uint16Array data");
   }
-  validateSampledRgb(data, config, rowStride, pixelStride);
+  validateSampledRgb(data, pixelConfig, rowStride, pixelStride);
 
   const {
     x0, y0, cropWidth, cropHeight, sampleWidth, sampleHeight, waveformWidth, waveformHeight,
@@ -466,10 +543,10 @@ export function analyzeFrame(frame, options = {}) {
 
   for (let sampleY = 0; sampleY < sampleHeight; sampleY += 1) {
     const sy = sampleHeight === cropHeight ? sampleY : sampledCoordinate(sampleY, cropHeight, sampleHeight);
-    const row = (y0 + sy) * rowStride;
+    const row = (localY0 + sy) * rowStride;
     for (let sampleX = 0; sampleX < sampleWidth; sampleX += 1) {
       const sx = sampleWidth === cropWidth ? sampleX : sampledCoordinate(sampleX, cropWidth, sampleWidth);
-      const offset = row + (x0 + sx) * pixelStride;
+      const offset = row + (localX0 + sx) * pixelStride;
       const rawR = data[offset];
       const rawG = data[offset + 1];
       const rawB = data[offset + 2];

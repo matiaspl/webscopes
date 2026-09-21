@@ -122,10 +122,24 @@ export interface ScopeResult {
     bitDepth?: 8 | 10 | 12;
     performance?: {
       backend?: "webgpu" | "cpu";
+      /** Time from update start through capture and analysis, before rendering. */
       frameTimeMs: number;
+      /** Reciprocal processing estimate based on frameTimeMs, not delivered updates. */
       fps: number;
       averageFrameTimeMs?: number;
       averageFps?: number;
+      /** Browser source capture and pixel readback time, when performed. */
+      captureTimeMs?: number;
+      /** Analysis time, including asynchronous WebGPU submission and histogram readback. */
+      analysisTimeMs?: number;
+      /** Automatic render time for this update; zero when no render was performed. */
+      renderTimeMs?: number;
+      /** Total elapsed update time, including automatic rendering. */
+      updateTimeMs?: number;
+      /** Bytes copied from a browser source for this update, when available. */
+      captureBytes?: number;
+      /** True when an exact native-size ROI was copied instead of the full frame. */
+      captureUsedRoi?: boolean;
     };
   };
 }
@@ -140,6 +154,59 @@ export interface Scopes {
   render(options?: RenderOptions): ScopeResult;
   renderFrame(frame: CanvasImageSource | VideoFrame | ImageData | PixelFrame | V210Frame, options?: Partial<ScopeOptions>): Promise<ScopeResult>;
   destroy(): void;
+}
+
+export interface ScopeDisplayOptions extends Omit<ScopeOptions, "canvas" | "backend" | "autoRender"> {
+  /** A fresh canvas that has not acquired a 2D rendering context. */
+  canvas: HTMLCanvasElement;
+  /** Called when the WebGPU queue has finished this frame's work; this is not compositor presentation. */
+  onQueueCompleted?: (event: { frameId: number; submittedFrames: number; queueCompletedFrames: number }) => void;
+  /** Called after the display device is lost. The caller can restore a Canvas2D surface. */
+  onDeviceLost?: (error: Error) => void;
+  onError?: (error: Error) => void;
+}
+
+export interface ScopeDisplayMetadata {
+  frameId: number;
+  width: number;
+  height: number;
+  sampleCount: number;
+  waveform: {
+    width: number;
+    height: number;
+    bitDepth: 8 | 10 | 12;
+    mode: WaveformModeName;
+    channelNames: string[];
+    channelCount: number;
+  };
+  vectorscope: { width: number; height: number; colorMatrix: ColorMatrixName };
+  stats: { colorMatrix: ColorMatrixName; bitDepth: 8 | 10 | 12 };
+}
+
+export type ScopeDisplayPresentResult =
+  | { status: "superseded" }
+  | {
+    status: "submitted";
+    frameId: number;
+    submittedFrames: number;
+    /** Frames whose WebGPU queue work completed; this is not compositor presentation. */
+    queueCompletedFrames: number;
+    metadata: ScopeDisplayMetadata;
+    /** CPU wall time through GPU queue submission, not GPU execution or display time. */
+    submissionTimeMs: number;
+  };
+
+export interface ScopeDisplay {
+  readonly canvas: HTMLCanvasElement;
+  readonly submittedFrames: number;
+  /** Highest submitted frame id whose WebGPU queue work completed, not a displayed-frame count. */
+  readonly queueCompletedFrames: number;
+  /** Submit a decoded browser source. Raw pixel arrays remain on createScopes/analyzeFrame. */
+  present(source: CanvasImageSource | VideoFrame, options?: Partial<Omit<ScopeOptions, "canvas" | "backend" | "autoRender">>): Promise<ScopeDisplayPresentResult>;
+  /** Read back the exact most recently submitted frame; every returned histogram is independently owned. */
+  snapshot(): Promise<ScopeResult>;
+  /** Release display-owned GPU resources and wait for in-flight GPU work. Caller-owned devices remain alive. */
+  destroy(): Promise<void>;
 }
 
 export declare const WaveformMode: Readonly<{ RGB: "rgb"; RGB_PARADE: "rgb-parade"; LUMA: "luma"; YCBCR_PARADE: "ycbcr-parade"; COMPOSITE: "composite" }>;
@@ -163,4 +230,5 @@ export declare function getDefaultScopesConfig(): ScopeOptions;
 export declare function analyzeFrame(frame: PixelFrame | V210Frame | ImageData, options?: Partial<ScopeOptions>): ScopeResult;
 export declare function renderScopes(result: ScopeResult, canvasOrContext: HTMLCanvasElement | OffscreenCanvas | CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, options?: RenderOptions): ScopeResult;
 export declare function createScopes(options?: ScopeOptions): Promise<Scopes>;
+export declare function createScopeDisplay(options: ScopeDisplayOptions): Promise<ScopeDisplay>;
 export declare const createVideoScopes: typeof createScopes;
