@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import { app, BrowserWindow, ipcMain, protocol } from "electron";
+import { resolveCaptureMode } from "./macadam-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "../..");
@@ -27,7 +28,9 @@ let nextRequestId = 1;
 const pendingRequests = new Map();
 let discoveredDevices = [];
 let deviceLabelsById = new Map();
+let inputFormatDetectionByDevice = new Map();
 const formatsByDevice = new Map();
+let gpuInfoAvailable = false;
 let analysisOptions = {
   region: { x: 0, y: 0, width: 1, height: 1 },
   waveformMode: "luma",
@@ -41,12 +44,33 @@ protocol.registerSchemesAsPrivileged([{
 }]);
 
 function sendStatus(message, kind = "info") {
-  if (!mainWindow?.isDestroyed()) mainWindow.webContents.send("decklink:status", { message, kind });
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("decklink:status", { message, kind });
 }
 
 function assertTrustedSender(event) {
   if (!mainWindow || event.sender !== mainWindow.webContents) throw new Error("Untrusted IPC sender");
 }
+
+function getGpuStatus() {
+  if (!gpuInfoAvailable) return { ready: false };
+  try {
+    const features = app.getGPUFeatureStatus();
+    return {
+      ready: true,
+      hardwareAccelerationEnabled: app.isHardwareAccelerationEnabled(),
+      gpuCompositing: features.gpu_compositing ?? "unknown",
+      canvas2d: features["2d_canvas"] ?? "unknown",
+    };
+  } catch {
+    return { ready: false };
+  }
+}
+
+app.on("gpu-info-update", () => {
+  gpuInfoAvailable = true;
+  const status = getGpuStatus();
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("decklink:gpu-status", status);
+});
 
 function helperExitError(signal, code) {
   const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
@@ -68,7 +92,7 @@ function handleHelperMessage(message) {
     settleRequest(message.id, message.ok ? undefined : new Error(message.error), message.result);
     return;
   }
-  if (message?.type !== "event" || mainWindow?.isDestroyed()) return;
+  if (message?.type !== "event" || !mainWindow || mainWindow.isDestroyed()) return;
   if (message.name === "status" && (message.value?.kind === "error" || /stopped|exited/i.test(message.value?.message ?? ""))) {
     capture = undefined;
   }
@@ -175,6 +199,7 @@ async function listDeckLinkDevices() {
   const devices = await requestHelper("list-devices");
   discoveredDevices = devices.map((device) => device.id);
   deviceLabelsById = new Map(devices.map((device) => [String(device.id), device.label]));
+  inputFormatDetectionByDevice = new Map(devices.map((device) => [String(device.id), device.supportsInputFormatDetection === true]));
   formatsByDevice.clear();
   return devices;
 }
@@ -205,15 +230,25 @@ function normalizeAnalysisOptions(nextOptions = {}) {
 async function startCapture({ device, formatKey, options }) {
   if (capture) await stopCapture("Switching DeckLink capture mode…");
   const deviceId = String(device);
-  const mode = formatsByDevice.get(deviceId)?.get(String(formatKey));
-  if (!discoveredDevices.includes(deviceId) || !mode) throw new Error("Refresh the device and mode lists before starting capture.");
+  if (!discoveredDevices.includes(deviceId)) throw new Error("Refresh the device and mode lists before starting capture.");
+  const listedModes = formatsByDevice.get(deviceId);
+  if (!listedModes) throw new Error("Refresh the device and mode lists before starting capture.");
+  const modes = [...listedModes.values()];
+  const { format: mode, autoDetect } = resolveCaptureMode(
+    formatKey,
+    modes,
+    inputFormatDetectionByDevice.get(deviceId) === true,
+  );
   if (mode.width > 16384 || mode.height > 16384) throw new RangeError("The selected frame dimensions exceed the sample's safe limit.");
   analysisOptions = normalizeAnalysisOptions(options);
 
-  const result = await requestHelper("start", { deviceId, formatKey: String(formatKey), options: analysisOptions });
+  const result = await requestHelper("start", { deviceId, formatKey: mode.key, autoDetect, options: analysisOptions });
   capture = { child: helper, width: result.width, height: result.height };
-  sendStatus(`Capturing ${deviceLabelsById.get(deviceId) ?? `device ${deviceId}`} · ${result.format} · 10-bit v210 input.`);
-  return result;
+  const deviceLabel = deviceLabelsById.get(deviceId) ?? `device ${deviceId}`;
+  sendStatus(autoDetect
+    ? `Capturing ${deviceLabel} · following the detected input format as 10-bit v210.`
+    : `Capturing ${deviceLabel} · ${result.format} · 10-bit v210 input.`);
+  return { ...result, autoDetect };
 }
 
 async function stopCapture(message = "Capture stopped.", kind = "info") {
@@ -260,6 +295,11 @@ ipcMain.handle("decklink:analysis-options", async (event, options) => {
   analysisOptions = normalizeAnalysisOptions(options);
   if (capture) await requestHelper("analysis-options", { options: analysisOptions });
   return true;
+});
+
+ipcMain.handle("decklink:gpu-status", (event) => {
+  assertTrustedSender(event);
+  return getGpuStatus();
 });
 
 function createWindow() {

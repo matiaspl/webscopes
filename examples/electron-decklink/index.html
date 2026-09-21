@@ -127,7 +127,8 @@
     <div class="help">
       <span><strong>Input:</strong> Blackmagic video captured as 10-bit YUV/v210; the preview is derived from the capture frame.</span>
       <span><strong>Drag or choose a preset:</strong> scope a region of interest.</span>
-      <span><strong>Analysis:</strong> CPU path, sampled to keep the live display responsive; waveform retains 10-bit code-value bins.</span>
+      <span><strong>Analysis:</strong> CPU v210 sampling at up to 10 updates/s; waveform retains 10-bit code-value bins.</span>
+      <span id="gpu-status"><strong>Electron GPU:</strong> checking acceleration status…</span>
     </div>
   </main>
   <script type="module" src="./renderer.js"></script>

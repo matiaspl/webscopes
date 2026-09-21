@@ -3,12 +3,21 @@ import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { applyMacadamAutoDetectPatch } from "./macadam-auto-detect.mjs";
 
 const require = createRequire(import.meta.url);
 const sampleRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const npmCli = process.env.npm_execpath;
 
 if (!npmCli) throw new Error("Run this setup with `npm run setup:native`.");
+
+const macadamRoot = path.dirname(require.resolve("@spaceagetv/macadam"));
+const macadamPackage = JSON.parse(readFileSync(path.join(macadamRoot, "package.json"), "utf8"));
+if (macadamPackage.version !== "2.1.1") {
+  throw new Error(`Expected Macadam 2.1.1, found ${macadamPackage.version}.`);
+}
+
+await applyMacadamAutoDetectPatch(macadamRoot);
 
 const electronRoot = path.dirname(require.resolve("electron"));
 const electronInstall = spawnSync(process.execPath, [path.join(electronRoot, "install.js")], {
@@ -26,12 +35,6 @@ const rebuild = spawnSync(process.execPath, [npmCli, "rebuild", "@spaceagetv/mac
 });
 if (rebuild.error) throw rebuild.error;
 if (rebuild.status !== 0) process.exit(rebuild.status ?? 1);
-
-const macadamRoot = path.dirname(require.resolve("@spaceagetv/macadam"));
-const macadamPackage = JSON.parse(readFileSync(path.join(macadamRoot, "package.json"), "utf8"));
-if (macadamPackage.version !== "2.1.1") {
-  throw new Error(`Expected Macadam 2.1.1, found ${macadamPackage.version}.`);
-}
 
 const api = require("@spaceagetv/macadam");
 const requiredFunctions = ["capture", "getDeviceInfo", "modeWidth", "modeHeight"];

@@ -53,6 +53,23 @@ export function listTenBitModes(device, macadam, deviceId) {
   return formats;
 }
 
+export function resolveCaptureMode(formatKey, formats, supportsInputFormatDetection = false) {
+  if (!Array.isArray(formats) || formats.length === 0) {
+    throw new Error("No 10-bit YUV capture modes are available for this device.");
+  }
+  const autoDetect = String(formatKey) === "auto";
+  if (autoDetect && !supportsInputFormatDetection) {
+    throw new Error("This device does not support automatic input format detection.");
+  }
+  const probeFormat = formats.find((candidate) => candidate.width === 1920
+    && candidate.height === 1080 && /1080i50/i.test(candidate.label ?? ""))
+    ?? formats.find((candidate) => candidate.width === 1920 && candidate.height === 1080)
+    ?? formats[0];
+  const format = autoDetect ? probeFormat : formats.find((candidate) => candidate.key === String(formatKey));
+  if (!format) throw new Error("Select a capture mode from the refreshed mode list.");
+  return { format, autoDetect };
+}
+
 export function makeV210Preview(data, width, height, bytesPerRow, options = {}) {
   const minimumRowBytes = v210BytesPerRow(width);
   if (!ArrayBuffer.isView(data) || bytesPerRow < minimumRowBytes || data.byteLength < bytesPerRow * height) {
@@ -77,26 +94,58 @@ export function makeV210Preview(data, width, height, bytesPerRow, options = {}) 
   for (let y = 0; y < previewHeight; y += 1) {
     const sourceY = Math.min(height - 1, Math.floor((y + 0.5) * height / previewHeight));
     const rowOffset = sourceY * bytesPerRow;
+    let cachedGroup = -1;
+    let word0 = 0;
+    let word1 = 0;
+    let word2 = 0;
+    let word3 = 0;
     for (let x = 0; x < previewWidth; x += 1) {
       const sourceX = Math.min(width - 1, Math.floor((x + 0.5) * width / previewWidth));
       const group = Math.floor(sourceX / 6);
       const pixel = sourceX % 6;
-      const offset = rowOffset + group * 16;
-      const word0 = bytes.getUint32(offset, true);
-      const word1 = bytes.getUint32(offset + 4, true);
-      const word2 = bytes.getUint32(offset + 8, true);
-      const word3 = bytes.getUint32(offset + 12, true);
-      const luma = [
-        (word0 >>> 10) & 1023,
-        word1 & 1023,
-        (word1 >>> 20) & 1023,
-        (word2 >>> 10) & 1023,
-        word3 & 1023,
-        (word3 >>> 20) & 1023,
-      ][pixel];
-      const chromaPair = Math.floor(pixel / 2);
-      const cb = [word0 & 1023, (word1 >>> 10) & 1023, (word2 >>> 20) & 1023][chromaPair];
-      const cr = [(word0 >>> 20) & 1023, word2 & 1023, (word3 >>> 10) & 1023][chromaPair];
+      if (group !== cachedGroup) {
+        const offset = rowOffset + group * 16;
+        word0 = bytes.getUint32(offset, true);
+        word1 = bytes.getUint32(offset + 4, true);
+        word2 = bytes.getUint32(offset + 8, true);
+        word3 = bytes.getUint32(offset + 12, true);
+        cachedGroup = group;
+      }
+      let luma;
+      let cb;
+      let cr;
+      switch (pixel) {
+        case 0:
+          luma = (word0 >>> 10) & 1023;
+          cb = word0 & 1023;
+          cr = (word0 >>> 20) & 1023;
+          break;
+        case 1:
+          luma = word1 & 1023;
+          cb = word0 & 1023;
+          cr = (word0 >>> 20) & 1023;
+          break;
+        case 2:
+          luma = (word1 >>> 20) & 1023;
+          cb = (word1 >>> 10) & 1023;
+          cr = word2 & 1023;
+          break;
+        case 3:
+          luma = (word2 >>> 10) & 1023;
+          cb = (word1 >>> 10) & 1023;
+          cr = word2 & 1023;
+          break;
+        case 4:
+          luma = word3 & 1023;
+          cb = (word2 >>> 20) & 1023;
+          cr = (word3 >>> 10) & 1023;
+          break;
+        default:
+          luma = (word3 >>> 20) & 1023;
+          cb = (word2 >>> 20) & 1023;
+          cr = (word3 >>> 10) & 1023;
+          break;
+      }
       const yy = range === "full" ? luma / 1023 : (luma - 64) / 876;
       const cbOffset = (cb - 512) / (range === "full" ? 1023 : 896);
       const crOffset = (cr - 512) / (range === "full" ? 1023 : 896);

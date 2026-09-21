@@ -14,6 +14,8 @@ let analysisOptions = {
   colorRange: "limited",
 };
 
+const ANALYSIS_INTERVAL_MS = 100;
+
 function send(message) {
   if (process.connected) process.send(message);
 }
@@ -40,6 +42,7 @@ function listDevices() {
   return devices.map((device, index) => ({
     id: String(index),
     label: device.displayName || device.modelName || `DeckLink ${index + 1}`,
+    supportsInputFormatDetection: device.supportsInputFormatDetection === true,
   }));
 }
 
@@ -90,8 +93,28 @@ function processCapturedFrame(state, frame) {
   const width = video.width;
   const height = video.height;
   const bytesPerRow = video.rowBytes;
+  if (width > 16384 || height > 16384 || v210BytesPerRow(width) * height > 128 * 1024 * 1024) {
+    throw new RangeError("The detected v210 input exceeds this sample's 128 MiB frame limit.");
+  }
+  if (state.autoDetect && video.hasNoInputSource) {
+    if (!state.reportedNoSignal) {
+      state.reportedNoSignal = true;
+      send({ type: "event", name: "status", value: { message: "Auto mode is waiting for a valid input signal.", kind: "info" } });
+    }
+    return;
+  }
   if (state.width !== width || state.height !== height) {
-    throw new Error(`DeckLink frame size changed from ${state.width}×${state.height} to ${width}×${height}.`);
+    if (!state.autoDetect) {
+      throw new Error(`DeckLink frame size changed from ${state.width}×${state.height} to ${width}×${height}.`);
+    }
+    state.width = width;
+    state.height = height;
+  }
+  if (state.autoDetect && (!state.reportedInputMode || state.reportedInputWidth !== width || state.reportedInputHeight !== height)) {
+    state.reportedInputMode = true;
+    state.reportedInputWidth = width;
+    state.reportedInputHeight = height;
+    send({ type: "event", name: "status", value: { message: `Auto mode following the detected ${width}×${height} input.`, kind: "info" } });
   }
   const startedAt = performance.now();
   const result = analyzeFrame({
@@ -113,26 +136,39 @@ function processCapturedFrame(state, frame) {
   state.averageAnalysisMs = state.averageAnalysisMs === undefined
     ? frameTimeMs
     : state.averageAnalysisMs + (frameTimeMs - state.averageAnalysisMs) * 0.2;
+  const publishedAt = performance.now();
+  if (state.lastScopeUpdateAt !== undefined) {
+    const intervalMs = publishedAt - state.lastScopeUpdateAt;
+    state.averageScopeIntervalMs = state.averageScopeIntervalMs === undefined
+      ? intervalMs
+      : state.averageScopeIntervalMs + (intervalMs - state.averageScopeIntervalMs) * 0.2;
+  }
+  state.lastScopeUpdateAt = publishedAt;
+  const updateFps = state.averageScopeIntervalMs > 0 ? 1000 / state.averageScopeIntervalMs : 0;
   result.stats.performance = {
     backend: "cpu",
     frameTimeMs,
     fps: frameTimeMs > 0 ? 1000 / frameTimeMs : 0,
     averageFrameTimeMs: state.averageAnalysisMs,
     averageFps: state.averageAnalysisMs > 0 ? 1000 / state.averageAnalysisMs : 0,
+    updateFps,
   };
   send({ type: "event", name: "scopes", value: result });
+
+  const now = performance.now();
+  let previewTimeMs = 0;
+  if (now - state.lastPreviewAt >= ANALYSIS_INTERVAL_MS) {
+    state.lastPreviewAt = now;
+    const previewStartedAt = performance.now();
+    const preview = makeV210Preview(video.data, width, height, bytesPerRow, analysisOptions);
+    previewTimeMs = performance.now() - previewStartedAt;
+    send({ type: "event", name: "preview", value: preview });
+  }
   send({
     type: "event",
     name: "telemetry",
-    value: { width, height, receivedFrames: state.receivedFrames, frameTimeMs },
+    value: { width, height, receivedFrames: state.receivedFrames, frameTimeMs, previewTimeMs, updateFps },
   });
-
-  const now = performance.now();
-  if (now - state.lastPreviewAt >= 200) {
-    state.lastPreviewAt = now;
-    const preview = makeV210Preview(video.data, width, height, bytesPerRow, analysisOptions);
-    send({ type: "event", name: "preview", value: preview });
-  }
 }
 
 async function captureLoop(state) {
@@ -146,7 +182,7 @@ async function captureLoop(state) {
       // of building a stale frame queue.
       nextFrame = state.channel.frame();
       state.receivedFrames += 1;
-      if (performance.now() - state.lastAnalysisAt < 200) continue;
+      if (performance.now() - state.lastAnalysisAt < ANALYSIS_INTERVAL_MS) continue;
       state.lastAnalysisAt = performance.now();
       processCapturedFrame(state, frame);
     }
@@ -163,6 +199,10 @@ async function startCapture(request) {
   const deviceIndex = Number(deviceId);
   const device = devices[deviceIndex];
   const format = modesByDevice.get(deviceId)?.get(String(request.formatKey));
+  const autoDetect = request.autoDetect === true;
+  if (autoDetect && device?.supportsInputFormatDetection !== true) {
+    throw new Error("This device does not support automatic input format detection.");
+  }
   if (!device || !format) throw new Error("Refresh the device and mode lists before starting capture.");
   if (format.width > 16384 || format.height > 16384) throw new RangeError("The selected frame dimensions exceed the sample's safe limit.");
   if (v210BytesPerRow(format.width) * format.height > 128 * 1024 * 1024) throw new RangeError("This sample supports v210 frames up to 128 MiB each.");
@@ -173,6 +213,7 @@ async function startCapture(request) {
     deviceIndex,
     displayMode: format.displayMode,
     pixelFormat: api.bmdFormat10BitYUV,
+    autoDetect,
   });
   if (channel.pixelFormat !== "10-bit YUV") {
     channel.stop();
@@ -183,6 +224,7 @@ async function startCapture(request) {
     channel,
     width: channel.width,
     height: channel.height,
+    autoDetect,
     receivedFrames: 0,
     lastAnalysisAt: 0,
     lastPreviewAt: 0,
@@ -190,7 +232,7 @@ async function startCapture(request) {
   };
   activeCapture = state;
   void captureLoop(state);
-  return { width: state.width, height: state.height, format: format.label };
+  return { width: state.width, height: state.height, format: format.label, autoDetect };
 }
 
 process.on("message", async (message) => {

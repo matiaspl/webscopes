@@ -20,10 +20,12 @@ const matrixSelect = document.querySelector("#matrix");
 const rangeSelect = document.querySelector("#range");
 const waveformLabel = document.querySelector("#waveform-label");
 const signalMeta = document.querySelector("#signal-meta");
+const gpuStatusLabel = document.querySelector("#gpu-status");
 
 let region = regionForPreset("full");
 let selectedMode;
 let captureActive = false;
+let deviceCapabilities = new Map();
 
 function setStatus(message, kind = "info") {
   status.textContent = message;
@@ -89,6 +91,7 @@ async function refreshDevices() {
   modeSelect.replaceChildren(new Option("Select device first", ""));
   try {
     const devices = await window.decklink.listDevices();
+    deviceCapabilities = new Map(devices.map((device) => [String(device.id), device.supportsInputFormatDetection === true]));
     deviceSelect.replaceChildren(new Option("Select Blackmagic input…", ""));
     for (const device of devices) deviceSelect.add(new Option(device.label, device.id));
     deviceSelect.disabled = devices.length === 0;
@@ -112,6 +115,13 @@ async function loadFormats() {
   try {
     const formats = await window.decklink.listFormats(device);
     modeSelect.replaceChildren(new Option("Select capture mode…", ""));
+    const supportsAuto = deviceCapabilities.get(String(device)) === true;
+    if (supportsAuto) {
+      const autoOption = new Option("Auto · follow input format", "auto");
+      autoOption.dataset.width = String(formats[0].width);
+      autoOption.dataset.height = String(formats[0].height);
+      modeSelect.add(autoOption);
+    }
     for (const format of formats) {
       const option = new Option(format.label, format.key);
       option.dataset.width = String(format.width);
@@ -119,8 +129,12 @@ async function loadFormats() {
       modeSelect.add(option);
     }
     modeSelect.disabled = false;
+    if (supportsAuto) modeSelect.value = "auto";
+    selectMode();
     const deviceLabel = deviceSelect.selectedOptions[0]?.textContent || device;
-    setStatus(`${formats.length} capture mode${formats.length === 1 ? "" : "s"} listed for ${deviceLabel}. Select the mode that matches the incoming signal.`);
+    setStatus(supportsAuto
+      ? `${formats.length} 10-bit mode${formats.length === 1 ? "" : "s"} listed for ${deviceLabel}. Auto follows the detected input format.`
+      : `${formats.length} capture mode${formats.length === 1 ? "" : "s"} listed for ${deviceLabel}. This device does not advertise automatic format detection.`);
   } catch (error) {
     modeSelect.replaceChildren(new Option("No modes found", ""));
     setStatus(error.message, "error");
@@ -137,7 +151,9 @@ function selectMode() {
   selectedMode = { width: Number(option.dataset.width), height: Number(option.dataset.height) };
   stage.style.aspectRatio = `${selectedMode.width} / ${selectedMode.height}`;
   startButton.disabled = captureActive;
-  videoMeta.textContent = `${selectedMode.width}×${selectedMode.height} · input`;
+  videoMeta.textContent = option.value === "auto"
+    ? `Auto · waiting for input format · ${selectedMode.width}×${selectedMode.height} fallback`
+    : `${selectedMode.width}×${selectedMode.height} · input`;
   drawRegion();
 }
 
@@ -155,7 +171,14 @@ async function startCapture() {
     modeSelect.disabled = true;
     refreshButton.disabled = true;
     stopButton.disabled = false;
-    videoMeta.textContent = `${result.width}×${result.height} · v210 10-bit`;
+    if (result.autoDetect) {
+      selectedMode = { width: result.width, height: result.height };
+      stage.style.aspectRatio = `${result.width} / ${result.height}`;
+      drawRegion();
+      videoMeta.textContent = `Auto · waiting for detected format · ${result.width}×${result.height} initial mode`;
+    } else {
+      videoMeta.textContent = `${result.width}×${result.height} · v210 10-bit`;
+    }
     scopeMeta.textContent = "Waiting for video frames…";
   } catch (error) {
     startButton.disabled = false;
@@ -221,12 +244,33 @@ window.decklink.onPreview(({ width, height, data }) => {
 
 window.decklink.onScopes((result) => {
   renderScopes(result, scopeCanvas, { layout: "side-by-side", dither: 0, vectorscopeDither: 0, gain: 0.18 });
-  scopeMeta.textContent = `${result.width}×${result.height} · ${result.stats.performance.averageFps.toFixed(1)} scope FPS · CPU`;
+  const updateFps = result.stats.performance.updateFps;
+  const rate = updateFps > 0 ? `${updateFps.toFixed(1)} updates/s` : "measuring update rate…";
+  scopeMeta.textContent = `${result.width}×${result.height} · ${rate} · CPU analysis`;
 });
 
 window.decklink.onTelemetry(({ width, height }) => {
-  videoMeta.textContent = `${width}×${height} · v210 10-bit`;
+  if (modeSelect.value === "auto") {
+    selectedMode = { width, height };
+    stage.style.aspectRatio = `${width} / ${height}`;
+    drawRegion();
+    videoMeta.textContent = `${width}×${height} · Auto · v210 10-bit`;
+  } else {
+    videoMeta.textContent = `${width}×${height} · v210 10-bit`;
+  }
 });
+
+function updateGpuStatus(result) {
+  const detail = result?.ready
+    ? ` acceleration ${result.hardwareAccelerationEnabled ? "on" : "off"} · compositor ${result.gpuCompositing} · v210 analysis CPU`
+    : " status not available yet";
+  const label = document.createElement("strong");
+  label.textContent = "Electron GPU:";
+  gpuStatusLabel.replaceChildren(label, document.createTextNode(detail));
+}
+
+window.decklink.onGpuStatus(updateGpuStatus);
+void window.decklink.getGpuStatus().then(updateGpuStatus).catch(() => updateGpuStatus(undefined));
 
 updateAnalysisOptions();
 drawRegion();
