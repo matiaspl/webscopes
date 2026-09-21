@@ -6,13 +6,13 @@
   "main": "main.js",
   "scripts": {
     "setup:native": "node scripts/setup-native.mjs",
-    "test": "node --test macadam-utils.test.js",
+    "test": "node --test ../../test/electron-decklink.test.js",
     "start": "electron ."
   },
   "devDependencies": {
     "electron": "^44.3.0"
   },
   "dependencies": {
-    "macadam": "2.0.18"
+    "@spaceagetv/macadam": "git+https://github.com/spaceagetv/macadam.git#392991c5a0dddb8318ea7423f9b1027418b311e3"
   }
 }

@@ -26,6 +26,7 @@ let capture;
 let nextRequestId = 1;
 const pendingRequests = new Map();
 let discoveredDevices = [];
+let deviceLabelsById = new Map();
 const formatsByDevice = new Map();
 let analysisOptions = {
   region: { x: 0, y: 0, width: 1, height: 1 },
@@ -85,7 +86,9 @@ function ensureHelper() {
   if (helper && helper.connected && helper.exitCode === null) return helper;
   helperStderr = "";
   helper = fork(helperPath, [], {
-    execPath: process.env.WEBSCOPES_NODE_PATH || process.env.npm_node_execpath || "node",
+    // Keep advanced IPC serialization on the same Node/V8 version as Electron.
+    execPath: process.env.WEBSCOPES_NODE_PATH || process.execPath,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
     cwd: os.tmpdir(),
     silent: true,
     serialization: "advanced",
@@ -171,6 +174,7 @@ function requestHelper(action, payload = {}, timeoutMs = 15000) {
 async function listDeckLinkDevices() {
   const devices = await requestHelper("list-devices");
   discoveredDevices = devices.map((device) => device.id);
+  deviceLabelsById = new Map(devices.map((device) => [String(device.id), device.label]));
   formatsByDevice.clear();
   return devices;
 }
@@ -208,7 +212,7 @@ async function startCapture({ device, formatKey, options }) {
 
   const result = await requestHelper("start", { deviceId, formatKey: String(formatKey), options: analysisOptions });
   capture = { child: helper, width: result.width, height: result.height };
-  sendStatus(`Capturing ${deviceId} · ${result.format} · 10-bit v210 SDI input.`);
+  sendStatus(`Capturing ${deviceLabelsById.get(deviceId) ?? `device ${deviceId}`} · ${result.format} · 10-bit v210 input.`);
   return result;
 }
 
@@ -222,9 +226,8 @@ async function stopCapture(message = "Capture stopped.", kind = "info") {
     } catch {
       try { child.kill("SIGTERM"); } catch {}
     }
-    // Macadam 2.0.18 does not settle outstanding frame() promises on stop.
-    // Recycle the helper so its native frame queue and SDK references cannot
-    // accumulate across capture sessions.
+    // Macadam does not settle an outstanding frame() promise on stop. Recycle
+    // the isolated helper so a later capture starts with a fresh native queue.
     await terminateHelper(child);
   }
   if (active || message !== "Capture stopped.") sendStatus(message, kind);

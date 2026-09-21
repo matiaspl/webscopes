@@ -1,14 +1,14 @@
 # Electron DeckLink / v210 sample
 
-This sample mirrors the live ROI page: it previews a DeckLink SDI input, lets you draw or preset an analysis region, and shows waveform plus vectorscope results. Macadam captures 10-bit YUV directly from DeckLink. The captured `bmdFormat10BitYUV` frame is v210 and is sent to the WebScopes analyzer without converting it through the preview.
+This sample mirrors the live ROI page: it previews a Blackmagic video input, lets you draw or preset an analysis region, and shows waveform plus vectorscope results. Macadam captures 10-bit YUV directly from a DeckLink or UltraStudio device. The captured `bmdFormat10BitYUV` frame is v210 and is sent to the WebScopes analyzer without converting it through the preview.
 
 ## Requirements
 
-- macOS, Windows, or Linux with a supported Blackmagic DeckLink card and Desktop Video driver.
+- macOS, Windows, or Linux with a supported Blackmagic DeckLink or UltraStudio device and Desktop Video driver.
 - Node.js 22.12 or newer, npm, and the platform's C/C++ build tools.
 - A video mode that the card reports as supporting 10-bit YUV capture.
 
-From this directory, install the packages and build the Macadam addon for the Node executable that will run its helper process:
+From this directory, install the packages, prepare Electron, and build or select Macadam's native addon for the Node helper:
 
 ```sh
 npm install
@@ -16,16 +16,16 @@ npm run setup:native
 npm start
 ```
 
-The local `.npmrc` disables package lifecycle scripts because Macadam's default install build is not compatible with newer experimental N-API headers. `setup:native` applies the N-API compatibility define, downloads Electron's runtime if needed, and builds Macadam plus its crash-handler dependency. Run it again after changing Node versions or architectures.
+The local `.npmrc` disables package lifecycle scripts. The sample pins the Electron-safe `spaceagetv/macadam` v2.1.1 source at a fixed commit. `setup:native` downloads Electron's runtime if needed, explicitly runs Macadam's native install hook, and verifies that the 10-bit capture API loads. The addon runs in the helper's Node process, not in Electron. Run setup again after changing Node versions or architectures.
 
-The app runs Macadam in a separate Node helper process. This keeps a native SDK crash from taking down the Electron window. If the helper exits unexpectedly, the app reports the failure and Macadam's crash log is written in the system temporary directory. Set `WEBSCOPES_NODE_PATH` if the `node` executable used by npm is not the one you want the helper to run.
+The app runs Macadam in a separate Node helper process, so a native SDK crash does not take down the Electron window. By default, the helper uses Electron's bundled Node runtime so advanced IPC serialization stays compatible with the main process. Set `WEBSCOPES_NODE_PATH` only to a Node executable with the same Node version as Electron; a different version can make the helper's IPC messages fail to decode. If the helper exits unexpectedly, the app reports the failure and Macadam's crash log is written in the system temporary directory.
 
-Click **Refresh inputs**, choose a DeckLink device, then choose the exact 10-bit mode matching the SDI signal. The app requests `bmdFormat10BitYUV` (v210). If the source is not already in the incoming signal's color range or matrix, select the appropriate scope interpretation in the toolbar.
+Select the active connector and input in Blackmagic Desktop Video Setup first. Click **Refresh inputs**, choose a device, then choose the exact 10-bit mode matching the incoming signal. The app requests `bmdFormat10BitYUV` (v210). If the source is not already in the incoming signal's color range or matrix, select the appropriate scope interpretation in the toolbar.
 
 ## Data path
 
 ```text
-DeckLink SDI (10-bit YUV / v210)
+Blackmagic video input (10-bit YUV / v210)
   ├─ Macadam frame buffer → WebScopes CPU analyzer → Electron scopes canvas
   └─ reduced RGBA preview derived from that frame → Electron picture canvas
 ```
@@ -37,4 +37,5 @@ The analyzer samples at reduced spatial resolution and updates up to five times 
 - This is a development sample run from the repository checkout, not a packaged product.
 - The renderer uses context isolation and a narrow preload bridge; it does not receive Node.js access.
 - Mode lists come from Macadam's DeckLink capability report and include only modes marked as supporting 10-bit YUV.
-- A successful native build does not prove that the installed driver/card combination can enumerate or capture. Validate with the actual DeckLink model and incoming SDI format.
+- Macadam v2.1.1 bundles DeckLink API 10.11.2 headers. Compatibility with the installed Desktop Video driver and the connected card/input must be confirmed on the target hardware.
+- A successful native build does not prove that the installed driver/device combination can capture. Validate with the actual Blackmagic device and incoming signal format.

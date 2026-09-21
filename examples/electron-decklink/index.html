@@ -54,19 +54,19 @@
     <header>
       <div>
         <div class="eyebrow">WebScopes / Electron sample</div>
-        <h1>SDI in.<br>10-bit scopes out.</h1>
-        <p>Macadam captures DeckLink SDI directly as packed v210 for analysis and creates a reduced preview from those same frames.</p>
+        <h1>Video in.<br>10-bit scopes out.</h1>
+        <p>Macadam captures Blackmagic video directly as packed v210 for analysis and creates a reduced preview from those same frames.</p>
       </div>
-      <div class="live-tag"><span class="live-dot"></span><span>DECKLINK · V210 · 10-BIT</span></div>
+      <div class="live-tag"><span class="live-dot"></span><span>BLACKMAGIC · V210 · 10-BIT</span></div>
     </header>
 
     <section class="toolbar" aria-label="Capture and scope controls">
-      <label class="control-label" for="device">DeckLink</label>
-      <select id="device" aria-label="DeckLink input device" disabled><option value="">Refresh inputs…</option></select>
+      <label class="control-label" for="device">Input device</label>
+      <select id="device" aria-label="Blackmagic input device" disabled><option value="">Refresh inputs…</option></select>
       <button id="refresh" type="button">Refresh inputs</button>
       <label class="control-label" for="mode">Mode</label>
-      <select id="mode" aria-label="DeckLink video mode" disabled><option value="">Select device first</option></select>
-      <button id="start" class="primary" type="button" disabled>Start SDI</button>
+      <select id="mode" aria-label="Video input mode" disabled><option value="">Select device first</option></select>
+      <button id="start" class="primary" type="button" disabled>Start capture</button>
       <button id="stop" class="stop" type="button" disabled>Stop</button>
       <span class="divider"></span>
       <span class="control-label">ROI</span>
@@ -95,14 +95,14 @@
       </select>
     </section>
 
-    <section class="workspace" aria-label="SDI picture and scopes">
+    <section class="workspace" aria-label="Video input picture and scopes">
       <article class="panel">
         <div class="panel-heading">
-          <h2>SDI picture / drag to select ROI</h2>
+          <h2>Input picture / drag to select ROI</h2>
           <span id="video-meta" class="panel-meta">No input selected</span>
         </div>
-        <div id="stage" class="video-stage" aria-label="SDI preview; drag to select an analysis region">
-          <canvas id="preview" aria-label="Live DeckLink SDI preview"></canvas>
+        <div id="stage" class="video-stage" aria-label="Video input preview; drag to select an analysis region">
+          <canvas id="preview" aria-label="Live Blackmagic input preview"></canvas>
           <div id="roi-box" class="roi-box"></div>
         </div>
         <div class="video-footer">
@@ -114,7 +114,7 @@
       <article class="panel">
         <div class="panel-heading">
           <h2>Live scopes</h2>
-          <span id="scope-meta" class="panel-meta">Waiting for SDI</span>
+          <span id="scope-meta" class="panel-meta">Waiting for input</span>
         </div>
         <div class="scope-wrap">
           <div class="scope-legend"><span id="waveform-label">LUMA</span><span id="signal-meta">BT.709 · LIMITED · 10-BIT</span></div>
@@ -123,9 +123,9 @@
       </article>
     </section>
 
-    <div id="status" role="status" aria-live="polite">Choose a DeckLink device. Requires the Blackmagic Desktop Video driver and a Macadam native build.</div>
+    <div id="status" role="status" aria-live="polite">Choose a Blackmagic input. Requires the Desktop Video driver and a Macadam native build.</div>
     <div class="help">
-      <span><strong>Input:</strong> DeckLink SDI captured as 10-bit YUV/v210; the preview is derived from the capture frame.</span>
+      <span><strong>Input:</strong> Blackmagic video captured as 10-bit YUV/v210; the preview is derived from the capture frame.</span>
       <span><strong>Drag or choose a preset:</strong> scope a region of interest.</span>
       <span><strong>Analysis:</strong> CPU path, sampled to keep the live display responsive; waveform retains 10-bit code-value bins.</span>
     </div>

@@ -1,4 +1,4 @@
-import { renderScopes } from "../../src/index.js";
+import { renderScopes } from "../../src/render.js";
 import { bindRoiSelection, createRoiSelectionController, regionForPreset } from "../roi-controls.js";
 
 const deviceSelect = document.querySelector("#device");
@@ -89,12 +89,12 @@ async function refreshDevices() {
   modeSelect.replaceChildren(new Option("Select device first", ""));
   try {
     const devices = await window.decklink.listDevices();
-    deviceSelect.replaceChildren(new Option("Select DeckLink input…", ""));
+    deviceSelect.replaceChildren(new Option("Select Blackmagic input…", ""));
     for (const device of devices) deviceSelect.add(new Option(device.label, device.id));
     deviceSelect.disabled = devices.length === 0;
-    setStatus(devices.length ? `Found ${devices.length} DeckLink input${devices.length === 1 ? "" : "s"}. Select a mode to start.` : "No DeckLink input found.");
+    setStatus(devices.length ? `Found ${devices.length} Blackmagic capture device${devices.length === 1 ? "" : "s"}. Select a mode to start.` : "No Blackmagic capture device found.");
   } catch (error) {
-    deviceSelect.replaceChildren(new Option("No DeckLink inputs", ""));
+    deviceSelect.replaceChildren(new Option("No Blackmagic inputs", ""));
     setStatus(error.message, "error");
   } finally {
     refreshButton.disabled = false;
@@ -119,7 +119,8 @@ async function loadFormats() {
       modeSelect.add(option);
     }
     modeSelect.disabled = false;
-    setStatus(`${formats.length} capture mode${formats.length === 1 ? "" : "s"} listed for ${device}. Select the mode that matches the incoming SDI signal.`);
+    const deviceLabel = deviceSelect.selectedOptions[0]?.textContent || device;
+    setStatus(`${formats.length} capture mode${formats.length === 1 ? "" : "s"} listed for ${deviceLabel}. Select the mode that matches the incoming signal.`);
   } catch (error) {
     modeSelect.replaceChildren(new Option("No modes found", ""));
     setStatus(error.message, "error");
@@ -136,7 +137,7 @@ function selectMode() {
   selectedMode = { width: Number(option.dataset.width), height: Number(option.dataset.height) };
   stage.style.aspectRatio = `${selectedMode.width} / ${selectedMode.height}`;
   startButton.disabled = captureActive;
-  videoMeta.textContent = `${selectedMode.width}×${selectedMode.height} · SDI`;
+  videoMeta.textContent = `${selectedMode.width}×${selectedMode.height} · input`;
   drawRegion();
 }
 

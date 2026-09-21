@@ -27,7 +27,7 @@ function reject(id, error) {
 }
 
 function getMacadam() {
-  if (!macadam) macadam = require("macadam");
+  if (!macadam) macadam = require("@spaceagetv/macadam");
   return macadam;
 }
 
@@ -141,8 +141,9 @@ async function captureLoop(state) {
     while (activeCapture === state && !state.stopped) {
       const frame = await (nextFrame ?? state.channel.frame());
       if (activeCapture !== state || state.stopped) break;
-      // Keep a native frame promise pending while analysis runs. Macadam 2.0.18
-      // leaks SDK frame references when callbacks arrive with no pending promise.
+      // Keep one frame request outstanding while analysis runs. Macadam drops
+      // surplus callback frames and releases their DeckLink references instead
+      // of building a stale frame queue.
       nextFrame = state.channel.frame();
       state.receivedFrames += 1;
       if (performance.now() - state.lastAnalysisAt < 200) continue;
