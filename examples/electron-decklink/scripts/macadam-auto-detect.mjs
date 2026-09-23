@@ -28,6 +28,90 @@ export function patchMacadamCaptureHeader(source) {
 export function patchMacadamCaptureSource(source) {
   source = replaceExactlyOnce(
     source,
+    '#include "capture_promise.h"\n',
+    `#include "capture_promise.h"
+
+static const char* macadamColorspaceName(int64_t value) {
+  switch (static_cast<uint32_t>(value)) {
+    case bmdColorspaceRec601: return "rec601";
+    case bmdColorspaceRec709: return "rec709";
+    case bmdColorspaceRec2020: return "rec2020";
+    default: return "unknown";
+  }
+}
+
+static const char* macadamColorspaceMatrix(int64_t value) {
+  switch (static_cast<uint32_t>(value)) {
+    case bmdColorspaceRec601: return "bt601";
+    case bmdColorspaceRec709: return "bt709";
+    case bmdColorspaceRec2020: return "bt2020";
+    default: return nullptr;
+  }
+}
+`,
+    "colorspace metadata helpers",
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    "  HRESULT hresult;\n  // TODO : Add support for ancillary data",
+    "  HRESULT hresult;\n  IDeckLinkVideoFrameMetadataExtensions* frameMetadata = nullptr;\n  int64_t colorspaceValue = 0;\n  int64_t eotfValue = 0;\n  // TODO : Add support for ancillary data",
+    "colorspace metadata locals",
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    `    c->status = napi_set_named_property(env, obj, "type", param);
+    REJECT_BAIL;
+
+    c->status = napi_create_int32(env, frame->videoFrame->GetWidth(), &param);`,
+    `    c->status = napi_set_named_property(env, obj, "type", param);
+    REJECT_BAIL;
+
+    hresult = frame->videoFrame->QueryInterface(IID_IDeckLinkVideoFrameMetadataExtensions, (void**) &frameMetadata);
+    if (hresult == S_OK && frameMetadata != nullptr) {
+      hresult = frameMetadata->GetInt(bmdDeckLinkFrameMetadataColorspace, &colorspaceValue);
+      if (hresult == S_OK) {
+        const char* colorspaceName = macadamColorspaceName(colorspaceValue);
+        const char* colorMatrix = macadamColorspaceMatrix(colorspaceValue);
+        c->status = napi_create_string_utf8(env, colorspaceName, NAPI_AUTO_LENGTH, &param);
+        REJECT_BAIL;
+        c->status = napi_set_named_property(env, obj, "colorspace", param);
+        REJECT_BAIL;
+        c->status = napi_create_int64(env, colorspaceValue, &param);
+        REJECT_BAIL;
+        c->status = napi_set_named_property(env, obj, "colorspaceCode", param);
+        REJECT_BAIL;
+        if (colorMatrix != nullptr) {
+          c->status = napi_create_string_utf8(env, colorMatrix, NAPI_AUTO_LENGTH, &param);
+          REJECT_BAIL;
+          c->status = napi_set_named_property(env, obj, "colorMatrix", param);
+          REJECT_BAIL;
+        }
+      }
+      if (frameMetadata->GetInt(bmdDeckLinkFrameMetadataHDRElectroOpticalTransferFunc, &eotfValue) == S_OK) {
+        c->status = napi_create_int64(env, eotfValue, &param);
+        REJECT_BAIL;
+        c->status = napi_set_named_property(env, obj, "eotf", param);
+        REJECT_BAIL;
+      }
+      frameMetadata->Release();
+      frameMetadata = nullptr;
+    }
+
+    c->status = napi_create_int32(env, frame->videoFrame->GetWidth(), &param);`,
+    "per-frame colorspace metadata",
+  );
+
+  source = replaceExactlyOnce(
+    source,
+    "bail:\n  if (!crts->framePromises.empty()) crts->framePromises.pop();",
+    "bail:\n  if (frameMetadata != nullptr) frameMetadata->Release();\n  if (!crts->framePromises.empty()) crts->framePromises.pop();",
+    "colorspace metadata cleanup",
+  );
+
+  source = replaceExactlyOnce(
+    source,
     `HRESULT captureThreadsafe::VideoInputFormatChanged(
   BMDVideoInputFormatChangedEvents notificationEvents,
   IDeckLinkDisplayMode *newDisplayMode,

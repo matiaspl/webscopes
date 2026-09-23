@@ -708,3 +708,22 @@ test("external qualification failure uses the canvas path without demoting WebGP
     assert.equal(device.state.textureCreates, 1);
   } finally { analyzer?.destroy(); restore(); }
 });
+
+test("createScopes selects the packed-v210 WebGPU pipeline and keeps readback explicit", async () => {
+  const restore = installGpuConstants();
+  let analyzer;
+  try {
+    const device = mockDevice();
+    analyzer = await createWebGpuAnalyzer({ device });
+    const frame = { format: "v210", data: new Uint8Array(16), width: 5, height: 1, bytesPerRow: 16, colorRange: "limited" };
+    const result = await analyzer.analyzeV210(frame, { waveformWidth: 5, waveformHeight: 1024, vectorscopeSize: 64 });
+    assert.equal(result.sampleCount, 5);
+    assert.equal(result.waveform.bitDepth, 10);
+    assert.equal(result.stats.colorRange, "limited");
+    assert.ok(device.state.shaderCodes.some((code) => code.includes("var<storage, read> packed")));
+    analyzer.destroy();
+  } finally {
+    analyzer?.destroy();
+    restore();
+  }
+});

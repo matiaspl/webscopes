@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+  window.sharedRgbaProbe.onFrame(async ({ data, rgbaWidth, height, bytesPerRow, sha256, format }) => {
+    try {
+      const unpacked = new Uint8Array(bytesPerRow * height);
+      for (let y = 0; y < height; y++) {
+        for (let byte = 0; byte < bytesPerRow; byte++) {
+          unpacked[y * bytesPerRow + byte] = data[y * rgbaWidth * 4 + Math.floor(byte / 3) * 4 + byte % 3];
+        }
+      }
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", unpacked));
+      const actual = Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+      window.sharedRgbaProbe.report({ parity: actual === sha256, typedArray: data instanceof Uint8Array, format });
+    } catch (error) {
+      window.sharedRgbaProbe.report({ error: error.message });
+    }
+  });
+</script>

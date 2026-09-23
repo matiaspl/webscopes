@@ -1,4 +1,4 @@
-import { analyzeCapturedPixels, analyzeFrame, captureFrameToCanvas, getSourceSize, isRawPixelFrame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
+import { analyzeCapturedPixels, analyzeFrame, captureFrameToCanvas, getSourceSize, isRawPixelFrame, isV210Frame, normalizeAnalysisOptions, readFramePixelsAsync } from "./analyze.js";
 import { renderScopes } from "./render.js";
 import { generateTestSignalSlate, TEST_SIGNAL_COLOR_MATRICES, TEST_SIGNAL_COLOR_RANGES, TEST_SIGNAL_PATTERNS } from "./slates.js";
 import { createWebGpuAnalyzer } from "./webgpu.js";
@@ -99,8 +99,15 @@ export async function createScopes(options = {}) {
       };
       const mergedOptions = { ...options, ...analysisOptions };
       const rawPixels = isRawPixelFrame(frame);
-      const useGpu = backend === "webgpu" && !rawPixels;
-      const frameOptions = rawPixels ? mergedOptions : { ...mergedOptions, bitDepth: mergedOptions.bitDepth ?? 8 };
+      const useGpu = backend === "webgpu" && (!rawPixels || isV210Frame(frame));
+      const frameOptions = rawPixels
+        ? {
+          ...mergedOptions,
+          bitDepth: isV210Frame(frame) ? (mergedOptions.bitDepth ?? 10) : mergedOptions.bitDepth,
+          colorMatrix: mergedOptions.colorMatrix ?? frame.colorMatrix,
+          colorRange: mergedOptions.colorRange ?? frame.colorRange,
+        }
+        : { ...mergedOptions, bitDepth: mergedOptions.bitDepth ?? 8 };
       const { width, height } = rawPixels ? frame : getSourceSize(frame);
       normalizeAnalysisOptions(width, height, frameOptions);
       let frameBackend = useGpu ? "webgpu" : "cpu";
@@ -173,9 +180,11 @@ export async function createScopes(options = {}) {
       try {
         if (useGpu) {
           try {
-            nextResult = await measureAsync("analysisTimeMs", () => isVideoInput
-              ? gpuAnalyzer.analyzeVideo(analysisSource, frameOptions)
-              : gpuAnalyzer.analyze(analysisSource, frameOptions));
+            nextResult = await measureAsync("analysisTimeMs", () => isV210Frame(frame)
+              ? gpuAnalyzer.analyzeV210(frame, frameOptions)
+              : isVideoInput
+                ? gpuAnalyzer.analyzeVideo(analysisSource, frameOptions)
+                : gpuAnalyzer.analyze(analysisSource, frameOptions));
           } catch (error) {
             if (destroyed) throw new Error("Scope analyzer has been destroyed");
             if (requestedBackend !== "auto" || backend !== "webgpu") throw error;

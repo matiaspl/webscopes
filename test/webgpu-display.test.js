@@ -158,6 +158,20 @@ function fixture() {
   return { width: 4, height: 3, nodeName: "IMG" };
 }
 
+function v210Fixture() {
+  const data = new Uint8Array(16);
+  const view = new DataView(data.buffer);
+  const values = [64, 512, 512, 128, 512, 512];
+  const words = [
+    values[0] | (values[1] << 10) | (values[2] << 20),
+    values[3] | (values[1] << 10) | (values[4] << 20),
+    values[2] | (values[3] << 10) | (values[5] << 20),
+    values[4] | (values[5] << 10) | (values[5] << 20),
+  ];
+  words.forEach((word, index) => view.setUint32(index * 4, word, true));
+  return { format: "v210", data, width: 5, height: 1, bytesPerRow: 16, colorMatrix: "bt709", colorRange: "limited" };
+}
+
 test("ScopeDisplay normalizes default video uploads through a reusable sRGB canvas", async () => {
   const restore = installGpuConstants();
   const previousCanvas = globalThis.OffscreenCanvas;
@@ -231,6 +245,32 @@ test("present submits without mapping bins and snapshot reads an owned result on
     await display.destroy();
     assert.equal(device.state.deviceDestroyCalls, 0, "caller-owned device remains alive");
     assert.equal(context.unconfigureCalls, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("present accepts packed v210, renders the optional preview, and keeps bins on the GPU", async () => {
+  const restore = installGpuConstants();
+  try {
+    const device = mockDevice();
+    const { canvas } = makeCanvas();
+    const preview = makeCanvas();
+    const display = await createScopeDisplay({ canvas, previewCanvas: preview.canvas, device });
+    const presented = await display.present(v210Fixture(), {
+      waveformWidth: 16,
+      waveformHeight: 1024,
+      vectorscopeSize: 64,
+      waveformMode: "ycbcr-parade",
+    });
+    assert.equal(presented.status, "submitted");
+    assert.equal(presented.metadata.waveform.bitDepth, 10);
+    assert.equal(presented.metadata.stats.colorRange, "limited");
+    assert.equal(device.state.mapCalls, 0);
+    assert.ok(device.state.shaders.some((code) => code.includes("var<storage, read> packed")));
+    assert.ok(device.state.shaders.length >= 4, "scope, display, v210 compute, and v210 preview shaders are created");
+    assert.equal(preview.context.configureCalls, 1);
+    await display.destroy();
   } finally {
     restore();
   }

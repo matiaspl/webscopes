@@ -275,26 +275,30 @@ test("unpacks v210 into native 10-bit luma/chroma scopes and 4:2:2 vectorscope s
   assert.equal(result.stats.colorRange, "limited");
 });
 
-test("converts limited and full-range v210 to RGB while preserving encoded luma bins", () => {
+test("maps v210 RGB scopes to the selected source code range", () => {
   const limited = packV210([64, 940, 64, 940, 64, 940], [512, 512, 512], [512, 512, 512]);
-  const limitedResult = analyzeFrame({ format: "v210", data: limited, width: 6, height: 1, bytesPerRow: 16 }, {
-    waveformMode: "rgb",
-    waveformWidth: 6,
-  });
-  for (const channel of limitedResult.waveform.channels) {
-    assert.equal(channel[0 * 6], 1);
-    assert.equal(channel[1023 * 6 + 1], 1);
+  for (const waveformMode of ["rgb", "rgb-parade"]) {
+    const result = analyzeFrame({ format: "v210", data: limited, width: 6, height: 1, bytesPerRow: 16 }, {
+      waveformMode,
+      waveformWidth: 6,
+    });
+    for (const channel of result.waveform.channels) {
+      assert.equal(channel[64 * 6], 1);
+      assert.equal(channel[940 * 6 + 1], 1);
+    }
   }
 
   const full = packV210([0, 1023, 0, 1023, 0, 1023], [512, 512, 512], [512, 512, 512]);
   const fullResult = analyzeFrame({ format: "v210", data: full, width: 6, height: 1, bytesPerRow: 16 }, {
-    waveformMode: "ycbcr-parade",
+    waveformMode: "rgb-parade",
     waveformWidth: 6,
     colorRange: "full",
   });
   assert.equal(fullResult.stats.colorRange, "full");
-  assert.equal(fullResult.waveform.channels[0][0], 1);
-  assert.equal(fullResult.waveform.channels[0][1023 * 6 + 1], 1);
+  for (const channel of fullResult.waveform.channels) {
+    assert.equal(channel[0], 1);
+    assert.equal(channel[1023 * 6 + 1], 1);
+  }
 });
 
 test("supports v210 row padding, typed-array views, ROI sampling, and createScopes", async () => {

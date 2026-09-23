@@ -1,6 +1,6 @@
 # webscopes
 
-`webscopes` is a JavaScript library for waveform and vectorscope monitoring in browsers and Electron renderer processes. It analyzes browser video frames, canvas images, `VideoFrame` objects, raw RGBA pixels, and packed v210 frames. WebGPU compute accelerates browser image sources when available; raw pixel and v210 frames use the CPU path.
+`webscopes` is a JavaScript library for waveform and vectorscope monitoring in browsers and Electron renderer processes. It analyzes browser video frames, canvas images, `VideoFrame` objects, raw RGBA pixels, and packed v210 frames. WebGPU compute accelerates browser image sources and packed v210 frames when available; CPU remains the automatic compatibility fallback.
 
 ## Quick start
 
@@ -67,7 +67,10 @@ import { createScopeDisplay } from "webscopes";
 const displayCanvas = document.createElement("canvas");
 displayCanvas.width = 960;
 displayCanvas.height = 520;
-const display = await createScopeDisplay({ canvas: displayCanvas });
+const previewCanvas = document.createElement("canvas");
+previewCanvas.width = 1920;
+previewCanvas.height = 1080;
+const display = await createScopeDisplay({ canvas: displayCanvas, previewCanvas });
 const submitted = await display.present(video, {
   waveformMode: "rgb-parade",
   colorMatrix: "bt709",
@@ -83,7 +86,9 @@ await display.destroy();
 
 The display canvas must not have acquired a 2D context. `present()` accepts decoded browser image and video sources, draws the scopes on the GPU, and returns frame metadata after queue submission without reading histogram bins back. If a newer request replaces the one pending behind two in-flight GPU slots, the replaced call resolves with `{ status: "superseded" }`. `snapshot()` reads the histogram for the most recently submitted frame at the time it is called; it returns ordinary `ScopeResult` arrays that are copied and remain unchanged after later presentations. Snapshot readback is only performed on demand.
 
-`submittedFrames` counts submitted frames. `queueCompletedFrames` is the highest submitted frame id whose WebGPU queue work has completed; this does not mean the browser compositor displayed that frame. `submissionTimeMs` is CPU wall time through submission, not GPU execution time or display latency. The API retains a caller-supplied `GPUDevice`; `destroy()` releases display-owned resources and waits for in-flight work without destroying that device. The API does not accept raw pixel arrays; use `createScopes()` for raw RGBA, floating-point, high-bit-depth, or v210 frames.
+`present()` also accepts a `V210Frame`. That path uploads packed words, decodes v210, accumulates waveform and vectorscope atomics, renders the scopes, and optionally renders `previewCanvas` with the same matrix/range conversion as the CPU v210 preview in one GPU submission. `createScopes.update(v210Frame)` supports `backend: "webgpu"` and reads bins back for the complete `ScopeResult` compatibility contract. The preview canvas, like the scope canvas, must be fresh and must not have acquired a 2D context.
+
+`submittedFrames` counts submitted frames. `queueCompletedFrames` is the highest submitted frame id whose WebGPU queue work has completed; this does not mean the browser compositor displayed that frame. `submissionTimeMs` is CPU wall time through submission, not GPU execution time or display latency. The API retains a caller-supplied `GPUDevice`; `destroy()` releases display-owned resources and waits for in-flight work without destroying that device. The API does not accept raw RGBA, floating-point, or unpacked high-bit-depth pixel arrays; use `createScopes()` for those sources. Packed v210 is supported by both `createScopes()` and `createScopeDisplay()`.
 
 The live demo has an explicit **Canvas2D / WebGPU direct** selector. Canvas2D remains the default. It prepares WebGPU on a new canvas before switching the visible surface, and restores the existing Canvas2D analyzer if initialization, presentation, or device availability fails. Raw and high-bit-depth sources stay on Canvas2D. Keep the direct renderer opt-in until its browser/device acceptance has been run for the target hardware.
 
@@ -118,9 +123,9 @@ await scopes.update({
 });
 ```
 
-The analyzer reads source Y, Cb, and Cr code values directly for luma and YCbCr waveforms, and preserves the shared 4:2:2 chroma samples on the vectorscope. RGB waveforms are derived using `colorMatrix` and `colorRange`; `colorRange` defaults to broadcast limited range and can be set to `"full"`. `bt2100` uses BT.2100's non-constant-luminance coefficients, which are the BT.2020 coefficients used here; it does not apply PQ or HLG transfer functions. The frame is fixed at 10-bit, so `bitDepth` overrides other than 10 are rejected. This is a frame analyzer, not a media-file decoder: your Electron decoder or capture pipeline must supply v210 bytes and their dimensions/stride. Import `webscopes` in the renderer bundle and expose only the narrow frame-transfer API needed by the renderer from your preload script.
+The analyzer reads source Y, Cb, and Cr code values directly for luma and YCbCr waveforms, and preserves the shared 4:2:2 chroma samples on the vectorscope. RGB waveforms are derived using `colorMatrix` and `colorRange`, then plotted on the selected source code range: limited-range black/white align with codes 64/940, while full-range uses 0/1023. `colorRange` defaults to broadcast limited range and can be set to `"full"`. `bt2100` uses BT.2100's non-constant-luminance coefficients, which are the BT.2020 coefficients used here; it does not apply PQ or HLG transfer functions. The frame is fixed at 10-bit, so `bitDepth` overrides other than 10 are rejected. This is a frame analyzer, not a media-file decoder: your Electron decoder or capture pipeline must supply v210 bytes and their dimensions/stride. Import `webscopes` in the renderer bundle and expose only the narrow frame-transfer API needed by the renderer from your preload script.
 
-For a runnable Electron example with DeckLink SDI capture, ROI controls, and a separate v210 analysis path, see [examples/electron-decklink](examples/electron-decklink/README.md).
+For a runnable Electron example with DeckLink SDI capture, ROI controls, a native three-slot v210 ring, and automatic WebGPU/Canvas2D fallback, see [examples/electron-decklink](examples/electron-decklink/README.md).
 
 ## Internal test signal slates
 

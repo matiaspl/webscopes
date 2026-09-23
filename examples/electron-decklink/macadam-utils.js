@@ -3,6 +3,13 @@ export function v210BytesPerRow(width) {
   return Math.ceil(width / 48) * 128;
 }
 
+export function v210CaptureSlotSize(modes, selectedMode, autoDetect) {
+  const candidates = autoDetect ? modes : [selectedMode];
+  const slotSize = Math.max(...candidates.map(({ width, height }) => v210BytesPerRow(width) * height));
+  if (!Number.isSafeInteger(slotSize) || slotSize < 1) throw new RangeError("A valid v210 capture mode is required");
+  return slotSize;
+}
+
 function normalizeModeName(name) {
   return String(name)
     .toLowerCase()
@@ -68,6 +75,117 @@ export function resolveCaptureMode(formatKey, formats, supportsInputFormatDetect
   const format = autoDetect ? probeFormat : formats.find((candidate) => candidate.key === String(formatKey));
   if (!format) throw new Error("Select a capture mode from the refreshed mode list.");
   return { format, autoDetect };
+}
+
+export function colorMatrixFromDeckLinkColorspace(colorspace) {
+  switch (String(colorspace ?? "").toLowerCase()) {
+    case "rec601":
+    case "bt601":
+      return "bt601";
+    case "rec709":
+    case "bt709":
+      return "bt709";
+    case "rec2020":
+    case "bt2020":
+    case "bt2100":
+      return "bt2020";
+    default:
+      return undefined;
+  }
+}
+
+export function colorMatrixCode(colorMatrix) {
+  switch (colorMatrixFromDeckLinkColorspace(colorMatrix)) {
+    case "bt601": return 1;
+    case "bt709": return 2;
+    case "bt2020": return 3;
+    default: return 0;
+  }
+}
+
+export function colorMatrixFromCode(code) {
+  switch (Number(code)) {
+    case 1: return "bt601";
+    case 2: return "bt709";
+    case 3: return "bt2020";
+    default: return undefined;
+  }
+}
+
+export function resolveCapturedColorMatrix(selection, frame = {}) {
+  if (selection !== "auto") return selection;
+  return colorMatrixFromDeckLinkColorspace(frame.colorMatrix ?? frame.colorspace) ?? "bt709";
+}
+
+function normalizeVITCUserBits(userbits) {
+  if (!Number.isInteger(userbits) || userbits < 0 || userbits > 0xffffffff) return null;
+  const value = userbits >>> 0;
+  return {
+    value,
+    hex: `0x${value.toString(16).padStart(8, "0").toUpperCase()}`,
+  };
+}
+
+function unavailableVITC(raw, userbits, reason) {
+  const normalizedUserBits = normalizeVITCUserBits(userbits);
+  return {
+    available: false,
+    valid: reason !== "invalid",
+    reason,
+    raw,
+    display: "--:--:--:--",
+    hours: null,
+    minutes: null,
+    seconds: null,
+    frames: null,
+    dropFrame: false,
+    framePair: null,
+    userBits: normalizedUserBits?.value ?? null,
+    userBitsHex: normalizedUserBits?.hex ?? null,
+  };
+}
+
+/**
+ * Parse the timecode metadata returned by Macadam's RP188 capture path.
+ *
+ * Macadam returns `false` when no timecode is present and otherwise uses
+ * HH:MM:SS:FF, HH:MM:SS;FF for drop-frame, with an optional .0/.1 frame-pair
+ * suffix for rates above 30 fps. Keep the raw value alongside the normalized
+ * fields so an operator can distinguish a missing signal from malformed
+ * metadata without making the capture loop fail.
+ */
+export function parseVITC(timecode, userbits) {
+  const raw = typeof timecode === "string" ? timecode.trim() : null;
+  if (timecode === false || timecode === undefined || timecode === null || raw === "" || raw === "false") {
+    return unavailableVITC(null, userbits, "unavailable");
+  }
+  if (!raw) return unavailableVITC(raw, userbits, "invalid");
+
+  const match = /^(\d{2}):(\d{2}):(\d{2})([:;])(\d{2})(?:\.([01]))?$/.exec(raw);
+  if (!match) return unavailableVITC(raw, userbits, "invalid");
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  const frames = Number(match[5]);
+  if (minutes > 59 || seconds > 59) return unavailableVITC(raw, userbits, "invalid");
+
+  const normalizedUserBits = normalizeVITCUserBits(userbits);
+  return {
+    available: true,
+    valid: true,
+    reason: null,
+    raw,
+    display: raw,
+    hours,
+    minutes,
+    seconds,
+    frames,
+    dropFrame: match[4] === ";",
+    framePair: match[6] === undefined ? null : Number(match[6]),
+    userBits: normalizedUserBits?.value ?? null,
+    userBitsHex: normalizedUserBits?.hex ?? null,
+  };
 }
 
 export function makeV210Preview(data, width, height, bytesPerRow, options = {}) {

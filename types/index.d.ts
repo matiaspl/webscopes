@@ -34,6 +34,20 @@ export interface V210Frame {
   colorMatrix?: ColorMatrixName;
 }
 
+/** Experimental Electron transport: v210 row bytes packed three per RGBA texel. */
+export interface PackedRgbaV210ExternalFrame {
+  format: "v210-rgba-external";
+  frame: VideoFrame;
+  width: number;
+  height: number;
+  bytesPerRow: number;
+  rgbaWidth: number;
+  /** Read back the reconstructed v210 bytes for one-frame transport validation. */
+  validateBytes?: boolean;
+  colorRange?: ColorRangeName;
+  colorMatrix?: ColorMatrixName;
+}
+
 export interface TestSignalSlate {
   label: string;
   standard: string;
@@ -161,6 +175,10 @@ export interface Scopes {
 export interface ScopeDisplayOptions extends Omit<ScopeOptions, "canvas" | "backend" | "autoRender"> {
   /** A fresh canvas that has not acquired a 2D rendering context. */
   canvas: HTMLCanvasElement;
+  /** Optional fresh WebGPU canvas for direct v210-to-RGB preview rendering. */
+  previewCanvas?: HTMLCanvasElement;
+  /** Canvas format used by previewCanvas; defaults to the preferred display format. */
+  previewFormat?: GPUTextureFormat;
   /** Called when the WebGPU queue has finished this frame's work; this is not compositor presentation. */
   onQueueCompleted?: (event: { frameId: number; submittedFrames: number; queueCompletedFrames: number }) => void;
   /** Called after the display device is lost. The caller can restore a Canvas2D surface. */
@@ -182,7 +200,7 @@ export interface ScopeDisplayMetadata {
     channelCount: number;
   };
   vectorscope: { width: number; height: number; colorMatrix: ColorMatrixName };
-  stats: { colorMatrix: ColorMatrixName; bitDepth: 8 | 10 | 12; videoColorMode?: "canvas" | "external-identity" | "external-apple" };
+  stats: { colorMatrix: ColorMatrixName; colorRange?: ColorRangeName; bitDepth: 8 | 10 | 12; videoColorMode?: "canvas" | "external-identity" | "external-apple" };
 }
 
 export type ScopeDisplayPresentResult =
@@ -196,6 +214,8 @@ export type ScopeDisplayPresentResult =
     metadata: ScopeDisplayMetadata;
     /** CPU wall time through GPU queue submission, not GPU execution or display time. */
     submissionTimeMs: number;
+    /** Present only when validateBytes was requested for an external packed frame. */
+    validationBytes?: Promise<Uint8Array>;
   };
 
 export interface ScopeDisplay {
@@ -203,8 +223,8 @@ export interface ScopeDisplay {
   readonly submittedFrames: number;
   /** Highest submitted frame id whose WebGPU queue work completed, not a displayed-frame count. */
   readonly queueCompletedFrames: number;
-  /** Submit a decoded browser source. Raw pixel arrays remain on createScopes/analyzeFrame. */
-  present(source: CanvasImageSource | VideoFrame, options?: Partial<Omit<ScopeOptions, "canvas" | "backend" | "autoRender">>): Promise<ScopeDisplayPresentResult>;
+  /** Submit a decoded browser source or packed v210 frame. Other raw pixel arrays remain on createScopes/analyzeFrame. */
+  present(source: CanvasImageSource | VideoFrame | V210Frame | PackedRgbaV210ExternalFrame, options?: Partial<Omit<ScopeOptions, "canvas" | "backend" | "autoRender">>): Promise<ScopeDisplayPresentResult>;
   /** Read back the exact most recently submitted frame; every returned histogram is independently owned. */
   snapshot(): Promise<ScopeResult>;
   /** Release display-owned GPU resources and wait for in-flight GPU work. Caller-owned devices remain alive. */

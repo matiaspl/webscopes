@@ -396,9 +396,14 @@ function analyzeV210Frame(frame, config, startedAt) {
       } else if (waveformMode === "composite") {
         channels[0][compositeValue * waveformWidth + column] += 1;
       } else {
-        channels[0][Math.round(red * yScale) * waveformWidth + column] += 1;
-        channels[1][Math.round(green * yScale) * waveformWidth + column] += 1;
-        channels[2][Math.round(blue * yScale) * waveformWidth + column] += 1;
+        // RGB is converted from normalized components for matrix math, then
+        // placed back on the selected source code range for waveform display.
+        const redCode = Math.round((yOffset + red * yRange) * yScale / 1023);
+        const greenCode = Math.round((yOffset + green * yRange) * yScale / 1023);
+        const blueCode = Math.round((yOffset + blue * yRange) * yScale / 1023);
+        channels[0][redCode * waveformWidth + column] += 1;
+        channels[1][greenCode * waveformWidth + column] += 1;
+        channels[2][blueCode * waveformWidth + column] += 1;
       }
       sampleCount += 1;
       if (y <= 1 / 1023) clippedLow += 1;

@@ -32,14 +32,22 @@
     .panel-heading h2 { margin: 0; color: #cbd5df; font: 650 11px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .1em; text-transform: uppercase; }
     .panel-meta { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; }
     .video-stage { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #030507; cursor: crosshair; touch-action: none; user-select: none; }
-    #preview { display: block; width: 100%; height: 100%; object-fit: contain; }
+    #preview, #preview-gpu { display: block; width: 100%; height: 100%; object-fit: contain; }
+    #preview-gpu, #scope-gpu { display: none; }
     .roi-box { position: absolute; display: none; z-index: 2; border: 1.5px solid var(--accent); box-shadow: 0 0 0 1px #07110e, 0 0 22px #77f2c03a; pointer-events: none; }
     .roi-box::before, .roi-box::after { content: ""; position: absolute; width: 8px; height: 8px; border-color: #e6fff4; border-style: solid; }
     .roi-box::before { top: -2px; left: -2px; border-width: 2px 0 0 2px; }
     .roi-box::after { right: -2px; bottom: -2px; border-width: 0 2px 2px 0; }
-    .video-footer { display: flex; justify-content: space-between; gap: 11px; align-items: center; padding: 12px 14px; border-top: 1px solid var(--line); }
+    .video-footer { display: flex; justify-content: space-between; gap: 11px; align-items: center; padding: 11px 14px; border-top: 1px solid var(--line); }
+    .timecode-readout { display: grid; min-width: 215px; flex: 1 1 215px; justify-items: center; gap: 1px; }
+    .timecode-label { color: var(--accent); font: 650 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; text-transform: uppercase; }
+    .timecode-value { color: #f2f7fb; font: 700 clamp(20px, 2.4vw, 30px)/1.05 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .07em; white-space: nowrap; }
+    .timecode-value[data-state="missing"] { color: #7f8b99; }
+    .timecode-value[data-state="invalid"] { color: #ff9b9b; font-size: clamp(16px, 2vw, 24px); }
+    .timecode-meta { color: var(--muted); font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
     .scope-wrap { padding: 12px; }
-    #scope { display: block; width: 100%; height: auto; border-radius: 6px; background: #070a0e; }
+    #scope, #scope-gpu { display: block; width: 100%; height: auto; border-radius: 6px; background: #070a0e; }
+    #preview-gpu, #scope-gpu { display: none; }
     .scope-legend { display: flex; justify-content: space-between; gap: 12px; padding: 0 3px 2px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
     #status { min-height: 39px; margin-top: 13px; padding: 10px 13px; border: 1px solid var(--line); border-radius: 8px; color: #a8b5c3; background: #0d1218; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
     #status[data-kind="error"] { color: #ff9b9b; border-color: #673c42; }
@@ -83,6 +91,7 @@
       </select>
       <label class="control-label" for="matrix">Matrix</label>
       <select id="matrix" aria-label="Color matrix">
+        <option value="auto">Auto · DeckLink metadata</option>
         <option value="bt709">BT.709</option>
         <option value="bt2020">BT.2020</option>
         <option value="bt2100">BT.2100 HDR</option>
@@ -102,11 +111,17 @@
           <span id="video-meta" class="panel-meta">No input selected</span>
         </div>
         <div id="stage" class="video-stage" aria-label="Video input preview; drag to select an analysis region">
-          <canvas id="preview" aria-label="Live Blackmagic input preview"></canvas>
+          <canvas id="preview" class="surface-cpu" aria-label="Live Blackmagic input preview"></canvas>
+          <canvas id="preview-gpu" class="surface-gpu" aria-label="Live Blackmagic input preview rendered by WebGPU"></canvas>
           <div id="roi-box" class="roi-box"></div>
         </div>
         <div class="video-footer">
           <span id="roi-meta" class="panel-meta">ROI 100% · full frame</span>
+          <div class="timecode-readout" aria-label="Vertical interval timecode">
+            <span class="timecode-label">VITC / RP188</span>
+            <output id="vitc-display" class="timecode-value" data-state="missing">--:--:--:--</output>
+            <span id="vitc-meta" class="timecode-meta">NO VITC · UB —</span>
+          </div>
           <span class="panel-meta">10-bit 4:2:2 source · preview is display-only</span>
         </div>
       </article>
@@ -117,8 +132,9 @@
           <span id="scope-meta" class="panel-meta">Waiting for input</span>
         </div>
         <div class="scope-wrap">
-          <div class="scope-legend"><span id="waveform-label">LUMA</span><span id="signal-meta">BT.709 · LIMITED · 10-BIT</span></div>
-          <canvas id="scope" width="960" height="520" aria-label="Live waveform and vectorscope"></canvas>
+          <div class="scope-legend"><span id="waveform-label">LUMA</span><span id="signal-meta">AUTO · LIMITED · 10-BIT</span></div>
+          <canvas id="scope" class="surface-cpu" width="960" height="520" aria-label="Live waveform and vectorscope"></canvas>
+          <canvas id="scope-gpu" width="960" height="520" aria-label="Live waveform and vectorscope rendered by WebGPU"></canvas>
         </div>
       </article>
     </section>
@@ -127,7 +143,7 @@
     <div class="help">
       <span><strong>Input:</strong> Blackmagic video captured as 10-bit YUV/v210; the preview is derived from the capture frame.</span>
       <span><strong>Drag or choose a preset:</strong> scope a region of interest.</span>
-      <span><strong>Analysis:</strong> CPU v210 sampling at up to 10 updates/s; waveform retains 10-bit code-value bins.</span>
+      <span><strong>Analysis:</strong> WebGPU decodes v210 directly when available; CPU fallback retains 10-bit code-value bins.</span>
       <span id="gpu-status"><strong>Electron GPU:</strong> checking acceleration status…</span>
     </div>
   </main>

@@ -1,25 +1,32 @@
 import { fork } from "node:child_process";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
-import { app, BrowserWindow, ipcMain, protocol } from "electron";
-import { resolveCaptureMode } from "./macadam-utils.js";
+import { app, BrowserWindow, ipcMain, MessageChannelMain, protocol, sharedTexture } from "electron";
+import { colorMatrixFromCode, resolveCaptureMode, v210CaptureSlotSize } from "./macadam-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "../..");
 const helperPath = path.join(__dirname, "macadam-helper.js");
+const require = createRequire(import.meta.url);
 const rendererFiles = new Set([
   "examples/electron-decklink/index.html",
   "examples/electron-decklink/renderer.js",
+  "examples/electron-decklink/macadam-utils.js",
+  "examples/electron-decklink/v210-rgba.js",
   "examples/roi-controls.js",
   "src/index.js",
   "src/analyze.js",
   "src/render.js",
   "src/webgpu.js",
+  "src/webgpu-render.js",
+  "src/video-color.js",
 ]);
 const allowedWaveformModes = new Set(["rgb", "rgb-parade", "luma", "ycbcr-parade", "composite"]);
-const allowedColorMatrices = new Set(["bt601", "bt709", "bt2020", "bt2100"]);
+const allowedColorMatrices = new Set(["auto", "bt601", "bt709", "bt2020", "bt2100"]);
 let mainWindow;
 let helper;
 let helperStderr = "";
@@ -31,10 +38,21 @@ let deviceLabelsById = new Map();
 let inputFormatDetectionByDevice = new Map();
 const formatsByDevice = new Map();
 let gpuInfoAvailable = false;
+let presentationMode = "cpu";
+let frameRing;
+let frameRingName;
+let frameRingSlotSize;
+let framePort;
+let frameTransferPool = [];
+const frameOutstanding = new Set();
+let frameTransportStats = { forwarded: 0, acknowledged: 0 };
+let useSharedRgba = process.platform === "darwin" && process.env.WEBSCOPES_RGBA_SHARED_TEXTURE === "1";
+const sharedPending = new Map();
+let sharedRgbaValidated = false;
 let analysisOptions = {
   region: { x: 0, y: 0, width: 1, height: 1 },
   waveformMode: "luma",
-  colorMatrix: "bt709",
+  colorMatrix: "auto",
   colorRange: "limited",
 };
 
@@ -45,6 +63,150 @@ protocol.registerSchemesAsPrivileged([{
 
 function sendStatus(message, kind = "info") {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("decklink:status", { message, kind });
+}
+
+function acceptFrameAck(event, value) {
+  if (!mainWindow || event.sender !== mainWindow.webContents) return;
+  reclaimFrameBuffer(value);
+}
+
+function reclaimFrameBuffer(value) {
+  const sequence = value?.sequence;
+  const shared = sharedPending.get(sequence);
+  if (shared && value?.sharedTextureError) {
+    sharedPending.delete(sequence);
+    useSharedRgba = false;
+    sendStatus(`RGBA shared texture failed byte validation: ${value.sharedTextureError}. Using the v210 IPC path.`, "error");
+    try { mainWindow?.webContents.postMessage("decklink:frame", shared); }
+    catch (error) { frameOutstanding.delete(sequence); sendStatus(`Could not retry the v210 frame: ${error.message}`, "error"); }
+    return;
+  }
+  if (!(typeof sequence === "bigint" || Number.isSafeInteger(sequence)) || !frameOutstanding.delete(sequence)) return;
+  frameTransportStats.acknowledged += 1;
+  sharedPending.delete(sequence);
+  if (shared && value?.sharedTextureValidated === true && !sharedRgbaValidated) {
+    sharedRgbaValidated = true;
+    sendStatus("RGBA external-texture GPU byte validation passed; v210 scopes remain exact.");
+  }
+  const buffer = value?.buffer;
+  if (buffer instanceof ArrayBuffer && buffer.byteLength >= frameRingSlotSize && frameTransferPool.length < 2) {
+    frameTransferPool.push(new Uint8Array(buffer));
+  } else if (shared?.frame?.data?.buffer instanceof ArrayBuffer && frameTransferPool.length < 2) {
+    frameTransferPool.push(new Uint8Array(shared.frame.data.buffer));
+  }
+  forwardLatestFrame();
+}
+
+function loadFrameRingAddon() {
+  return require("./frame-ring.cjs");
+}
+
+function closeFrameTransport() {
+  try { framePort?.close(); } catch {}
+  framePort = undefined;
+  try { frameRing?.close(); } catch {}
+  frameRing = undefined;
+  frameRingName = undefined;
+  frameRingSlotSize = undefined;
+  frameTransferPool = [];
+  frameOutstanding.clear();
+  sharedPending.clear();
+  frameTransportStats = { forwarded: 0, acknowledged: 0 };
+  sharedRgbaValidated = false;
+}
+
+function openFrameTransport(slotSize) {
+  closeFrameTransport();
+  const addon = loadFrameRingAddon();
+  // macOS POSIX shared-memory names are limited to 31 characters.
+  frameRingName = `wsgpu-${process.pid}-${randomUUID().slice(0, 8)}`;
+  frameRingSlotSize = slotSize;
+  frameRing = new addon.FrameRing(frameRingName, 3, slotSize, true);
+  frameTransferPool = Array.from({ length: 2 }, () => new Uint8Array(slotSize));
+  if (!MessageChannelMain) return;
+  const channel = new MessageChannelMain();
+  framePort = channel.port1;
+  framePort.on("message", ({ data }) => {
+    if (data?.type === "ack") reclaimFrameBuffer(data);
+  });
+  framePort.start();
+  mainWindow?.webContents.postMessage("decklink:frame-port", {}, [channel.port2]);
+}
+
+function forwardLatestFrame() {
+  if (!frameRing || !mainWindow || mainWindow.isDestroyed() || frameOutstanding.size >= 2) return;
+  const packet = frameRing.readLatest(frameTransferPool.shift());
+  if (!packet) return;
+  const packetBuffer = ArrayBuffer.isView(packet.data) ? packet.data.buffer : packet.data;
+  const packetOffset = ArrayBuffer.isView(packet.data) ? packet.data.byteOffset : 0;
+  const frame = {
+    format: "v210",
+    data: new Uint8Array(packetBuffer, packetOffset, packet.byteLength),
+    width: packet.width,
+    height: packet.height,
+    bytesPerRow: packet.bytesPerRow,
+    timestamp: packet.timestamp,
+    sequence: packet.sequence,
+    colorMatrix: colorMatrixFromCode(packet.colorMatrixCode),
+    colorMatrixCode: packet.colorMatrixCode,
+    eotf: packet.eotf,
+  };
+  frameTransportStats.forwarded += 1;
+  frameOutstanding.add(frame.sequence);
+  const dropped = Number(frameRing.stats().dropped ?? 0);
+  // Keep the reusable frame pool bounded. The renderer preserves this view
+  // instead of copying each large payload into another Uint8Array.
+  try {
+    if (useSharedRgba) {
+      sharedPending.set(frame.sequence, { frame, dropped });
+      void forwardSharedRgba(frame, dropped);
+    } else mainWindow.webContents.postMessage("decklink:frame", { frame, dropped });
+  } catch (error) {
+    frameOutstanding.delete(frame.sequence);
+    sendStatus(`Could not forward a GPU frame: ${error.message}`, "error");
+  }
+}
+
+async function forwardSharedRgba(frame, dropped) {
+  let surface;
+  let imported;
+  try {
+    if (typeof sharedTexture?.importSharedTexture !== "function" || typeof sharedTexture?.sendSharedTexture !== "function") {
+      throw new Error("Electron sharedTexture is unavailable");
+    }
+    surface = require("./shared-rgba.cjs").createPackedSurface(frame.data, frame.width, frame.height, frame.bytesPerRow);
+    imported = sharedTexture.importSharedTexture({
+      textureInfo: {
+        pixelFormat: "rgba",
+        colorSpace: { matrix: "rgb", primaries: "bt709", transfer: "srgb", range: "full" },
+        codedSize: { width: surface.width, height: surface.height },
+        handle: { ioSurface: surface.ioSurface },
+      },
+      allReferencesReleased: () => surface.close(),
+    });
+    const sha256 = sharedRgbaValidated ? undefined : createHash("sha256").update(frame.data).digest("hex");
+    await sharedTexture.sendSharedTexture({ frame: mainWindow.webContents.mainFrame, importedSharedTexture: imported }, {
+      width: frame.width, height: frame.height, bytesPerRow: frame.bytesPerRow,
+      rgbaWidth: surface.width, sequence: frame.sequence, timestamp: frame.timestamp,
+      colorMatrix: frame.colorMatrix, colorMatrixCode: frame.colorMatrixCode, eotf: frame.eotf,
+      dropped, sha256,
+    });
+  } catch (error) {
+    useSharedRgba = false;
+    sendStatus(`RGBA shared texture unavailable: ${error.message}. Using the v210 IPC path.`, "error");
+    const pending = sharedPending.get(frame.sequence);
+    if (pending && mainWindow && !mainWindow.isDestroyed()) {
+      sharedPending.delete(frame.sequence);
+      try { mainWindow.webContents.postMessage("decklink:frame", { frame, dropped }); }
+      catch (forwardError) {
+        frameOutstanding.delete(frame.sequence);
+        sendStatus(`Could not retry the v210 frame: ${forwardError.message}`, "error");
+      }
+    }
+    if (!imported) surface?.close();
+  } finally {
+    imported?.release();
+  }
 }
 
 function assertTrustedSender(event) {
@@ -96,11 +258,16 @@ function handleHelperMessage(message) {
   if (message.name === "status" && (message.value?.kind === "error" || /stopped|exited/i.test(message.value?.message ?? ""))) {
     capture = undefined;
   }
+  if (message.name === "frame-ready") {
+    forwardLatestFrame();
+    return;
+  }
   const channels = {
     status: "decklink:status",
     preview: "decklink:preview",
     scopes: "decklink:scopes",
     telemetry: "decklink:telemetry",
+    vitc: "decklink:vitc",
   };
   const channel = channels[message.name];
   if (channel) mainWindow.webContents.send(channel, message.value);
@@ -112,7 +279,11 @@ function ensureHelper() {
   helper = fork(helperPath, [], {
     // Keep advanced IPC serialization on the same Node/V8 version as Electron.
     execPath: process.env.WEBSCOPES_NODE_PATH || process.execPath,
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: "1",
+      WEBSCOPES_FRAME_RING_ABI: process.env.WEBSCOPES_NODE_PATH ? "node" : "electron",
+    },
     cwd: os.tmpdir(),
     silent: true,
     serialization: "advanced",
@@ -140,6 +311,7 @@ function ensureHelper() {
     }
     if (capture?.child === child) {
       capture = undefined;
+      closeFrameTransport();
       sendStatus(error.message, "error");
     }
   });
@@ -242,13 +414,40 @@ async function startCapture({ device, formatKey, options }) {
   if (mode.width > 16384 || mode.height > 16384) throw new RangeError("The selected frame dimensions exceed the sample's safe limit.");
   analysisOptions = normalizeAnalysisOptions(options);
 
-  const result = await requestHelper("start", { deviceId, formatKey: mode.key, autoDetect, options: analysisOptions });
-  capture = { child: helper, width: result.width, height: result.height };
+  let outputMode = "cpu";
+  if (presentationMode === "gpu") {
+    try {
+      // Auto-detection starts with a probe mode but can switch to any advertised
+      // input mode. Size the bounded ring for the largest supported v210 frame
+      // so a valid 4K signal cannot force an unnecessary CPU fallback.
+      openFrameTransport(v210CaptureSlotSize(modes, mode, autoDetect));
+      outputMode = "v210-ring";
+    } catch (error) {
+      closeFrameTransport();
+      sendStatus(`WebGPU frame transport unavailable; using CPU fallback. ${error.message}`, "info");
+    }
+  }
+  let result;
+  try {
+    result = await requestHelper("start", {
+      deviceId,
+      formatKey: mode.key,
+      autoDetect,
+      options: analysisOptions,
+      outputMode,
+      ring: outputMode === "v210-ring" ? { name: frameRingName, slotCount: 3, slotSize: frameRingSlotSize } : undefined,
+    });
+  } catch (error) {
+    closeFrameTransport();
+    throw error;
+  }
+  if (outputMode === "v210-ring" && result.outputMode !== "v210-ring") closeFrameTransport();
+  capture = { child: helper, width: result.width, height: result.height, outputMode: result.outputMode ?? outputMode };
   const deviceLabel = deviceLabelsById.get(deviceId) ?? `device ${deviceId}`;
   sendStatus(autoDetect
     ? `Capturing ${deviceLabel} · following the detected input format as 10-bit v210.`
     : `Capturing ${deviceLabel} · ${result.format} · 10-bit v210 input.`);
-  return { ...result, autoDetect };
+  return { ...result, autoDetect, outputMode: capture.outputMode };
 }
 
 async function stopCapture(message = "Capture stopped.", kind = "info") {
@@ -265,6 +464,7 @@ async function stopCapture(message = "Capture stopped.", kind = "info") {
     // the isolated helper so a later capture starts with a fresh native queue.
     await terminateHelper(child);
   }
+  closeFrameTransport();
   if (active || message !== "Capture stopped.") sendStatus(message, kind);
   return Boolean(active);
 }
@@ -300,6 +500,20 @@ ipcMain.handle("decklink:analysis-options", async (event, options) => {
 ipcMain.handle("decklink:gpu-status", (event) => {
   assertTrustedSender(event);
   return getGpuStatus();
+});
+
+ipcMain.on("decklink:frame-ack", acceptFrameAck);
+
+ipcMain.handle("decklink:presentation-mode", async (event, mode) => {
+  assertTrustedSender(event);
+  if (mode !== "gpu" && mode !== "cpu") throw new RangeError("Presentation mode must be gpu or cpu.");
+  presentationMode = mode;
+  if (capture) {
+    await requestHelper("output-mode", { mode: mode === "gpu" ? "v210-ring" : "cpu" });
+    capture.outputMode = mode === "gpu" ? "v210-ring" : "cpu";
+    if (mode === "cpu") closeFrameTransport();
+  }
+  return { mode: presentationMode, outputMode: capture?.outputMode ?? presentationMode };
 });
 
 function createWindow() {
@@ -339,7 +553,10 @@ app.whenReady().then(() => {
     try {
       const body = await readFile(filePath);
       const contentType = path.extname(filePath) === ".html" ? "text/html; charset=utf-8" : "text/javascript; charset=utf-8";
-      return new Response(body, { headers: { "Content-Type": contentType, "X-Content-Type-Options": "nosniff" } });
+      return new Response(body, { headers: {
+        "Content-Type": contentType,
+        "X-Content-Type-Options": "nosniff",
+      } });
     } catch {
       return new Response("Not found", { status: 404 });
     }
